@@ -23,7 +23,7 @@ module Chatbot
       ollama_config.api_keys = config.api_keys if config.api_keys
       ollama_config.enable_multi_key_concurrency = config.enable_multi_key_concurrency
 
-      @client = Ollama::Client.new(config: ollama_config, model: config.model)
+      @client = Ollama::Client.new(config: ollama_config)
 
       store ||= Stores::Memory.new
       @conversation = Conversation.new(config: config, store: store)
