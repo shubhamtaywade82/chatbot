@@ -8,7 +8,7 @@ module Chatbot
                   :embedding_model, :conversation_persistence_path, :log_level,
                   :enable_streaming, :store_adapter
 
-    attr_accessor :binance_api_key, :binance_api_secret
+    attr_accessor :binance_api_key, :binance_api_secret, :coindcx_api_key, :coindcx_api_secret
 
     def initialize
       @base_url = ENV.fetch("CHAT_BASE_URL", "http://localhost:11434")
@@ -29,6 +29,8 @@ module Chatbot
       @store_adapter = :json
       @binance_api_key = ENV["CHAT_BINANCE_API_KEY"]
       @binance_api_secret = ENV["CHAT_BINANCE_API_SECRET"]
+      @coindcx_api_key = ENV["CHAT_COINDCX_API_KEY"]
+      @coindcx_api_secret = ENV["CHAT_COINDCX_API_SECRET"]
     end
 
     def cloud?

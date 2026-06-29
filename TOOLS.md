@@ -93,22 +93,34 @@ To add the same tool as a built-in in ollama_agent:
 |------|-------------|------------------------|
 | `get_funding_rate` | Current + historical funding rates | Sentiment, cost of holding |
 | `get_open_interest` | Open interest (current + 24h trend) | Trend confirmation, reversals |
+| `subscribe_market_data` | Real-time trades/klines/depth20 via Binance WebSocket | Entry timing, tick-level execution |
+
+### Real-Time Market Data (no auth)
+
+| Tool | What it does | Duration | When the model calls it |
+|------|-------------|----------|------------------------|
+| `subscribe_market_data` | Streams live trade prints, 1m/5m klines, or top-20 depth via Binance WebSocket | 1-30s (default 5s) | Entry timing — needs latest tick before executing |
 
 ### Account & Position Management (requires API key)
 
 | Tool | What it does | When the model calls it |
 |------|-------------|------------------------|
-| `get_account_balance` | Wallet balance, available margin per asset | Check available funds before trading |
-| `get_positions` | Open positions: entry, liq price, PnL, leverage | Review current exposure |
-| `get_open_orders` | List pending orders | Find order IDs, check what's queued |
-| `set_leverage` | Set leverage per pair (1-125x) | Before placing a trade |
+| `get_account_balance` | Binance wallet balance, available margin per asset | Check available funds before trading |
+| `get_positions` | Binance open positions: entry, liq price, PnL, leverage | Review current exposure |
+| `get_open_orders` | Binance pending orders | Find order IDs, check what's queued |
+| `set_leverage` | Set Binance leverage per pair (1-125x) | Before placing a trade |
+| `coindcx_get_balance` | CoinDCX account balances for all assets | Check CoinDCX funds for execution |
+| `coindcx_get_positions` | CoinDCX open positions (entry, PnL, qty) | Review CoinDCX exposure |
+| `coindcx_get_open_orders` | CoinDCX pending orders | Find CoinDCX order IDs for cancellation |
 
-### Trade Execution (requires API key)
+### Trade Execution (requires CoinDCX API key)
 
 | Tool | What it does | When the model calls it |
 |------|-------------|------------------------|
-| `place_order` | Place MARKET/LIMIT/STOP/TP order | **Only after user confirms** trade details |
-| `cancel_order` | Cancel an open order by symbol + orderId | Remove stale/mistaken orders |
+| `coindcx_place_order` | Place market/limit order on CoinDCX | **Only after user confirms** trade details |
+| `coindcx_cancel_order` | Cancel an open order by ID on CoinDCX | Remove stale/mistaken orders |
+| `place_order` | Place MARKET/LIMIT/STOP/TP order on Binance | Fallback — CoinDCX preferred |
+| `cancel_order` | Cancel an open order on Binance | Fallback — CoinDCX preferred |
 
 ### Risk Management (requires API key)
 
@@ -194,6 +206,37 @@ API key requirements (Binance Futures):
 - Permissions: enable "Futures" (Enable Trading + Enable Withdrawals optional)
 - Never share or commit your API secret
 
+## CoinDCX API Authentication
+
+Trade execution uses CoinDCX with HMAC SHA256 signed POST requests:
+
+```bash
+export CHAT_COINDCX_API_KEY="your_coindcx_key"
+export CHAT_COINDCX_API_SECRET="your_coindcx_secret"
+```
+
+```ruby
+# In CoinDCX.signed_post:
+json_body = JSON.generate(body_data)
+signature = OpenSSL::HMAC.hexdigest("SHA256", secret, json_body)
+# Headers: X-AUTH-APIKEY, X-AUTH-SIGNATURE, Content-Type: application/json
+```
+
+API key requirements (CoinDCX):
+- Create API key with trade permissions in CoinDCX dashboard
+- Never share or commit your API secret
+
+## WebSocket Market Data
+
+The `subscribe_market_data` tool streams data from Binance WebSocket for a configurable duration:
+
+- **Streams**: `trade` (live trades), `kline_1m`, `kline_5m`, `depth20` (top 20 bid/ask)
+- **Duration**: 1-30 seconds (default 5s)
+- **Returns**: Summary with last/avg/high/low price, volume, sample entries
+- **Used for**: Entry timing — getting the latest tick before executing a market order
+
+Implementation uses `websocket-client-simple` gem and connects to `wss://stream.binance.com:9443/ws/<symbol>@<stream>`.
+
 ## Tool Workflow for Automated Trading
 
 ```
@@ -216,8 +259,8 @@ User: "Swing trade SOLUSDT"
   
 User: "confirm"
   → set_leverage
-  → place_order
-  → get_positions (verify fill)
+  → coindcx_place_order (CoinDCX preferred for execution)
+  → get_positions / coindcx_get_positions (verify fill)
 ```
 
 ## SMC Engines Architecture

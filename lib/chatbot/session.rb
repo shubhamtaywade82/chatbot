@@ -1617,7 +1617,7 @@ OllamaAgent::Tools.register("subscribe_market_data", schema: {
 }) do |args, **|
   require "websocket-client-simple"
 
-  symbol = args["symbol"].to_s.downcase.strip.gsub("usdt", "usdt")
+  symbol = args["symbol"].to_s.downcase.strip.sub("usdt", "usdt")
   channel = args["channel"] || "trade"
   duration = [args["duration_sec"]&.to_i || 5, 30].min
 
@@ -1632,33 +1632,30 @@ OllamaAgent::Tools.register("subscribe_market_data", schema: {
   url = "wss://stream.binance.com:9443/ws/#{stream_name}"
   data_buf = []
   error_buf = nil
-  done = false
+  connected = false
 
   ws = WebSocket::Client::Simple.connect(url)
 
-  ws.on(:message) do |msg|
-    data_buf << msg.data
+  ws.on(:open) { connected = true }
+  ws.on(:message) { |msg| data_buf << msg.data }
+  ws.on(:error) { |err| error_buf = err.message }
+  ws.on(:close) { }
+
+  20.times do
+    break if connected || error_buf
+    sleep 0.1
   end
 
-  ws.on(:error) do |err|
-    error_buf = err.message
-    done = true
+  unless connected || data_buf.any?
+    ws.close rescue nil
+    next error_buf ? "WebSocket error: #{error_buf}" : "WebSocket connection timeout to #{url}"
   end
 
-  ws.on(:close) do
-    done = true
-  end
-
-  # Collect data for the specified duration
   sleep duration
-  ws.close
-  done = true
+  ws.close rescue nil
+  sleep 0.3
 
-  if error_buf
-    "WebSocket error: #{error_buf}"
-  elsif data_buf.empty?
-    "No data received in #{duration}s. Check symbol '#{symbol}' and try again."
-  else
+  if data_buf.any?
     parsed = data_buf.map { |d| JSON.parse(d) rescue nil }.compact
     count = parsed.size
 
@@ -1692,7 +1689,7 @@ OllamaAgent::Tools.register("subscribe_market_data", schema: {
     end
   end
 rescue => e
-  "Error: #{e.message}"
+  "WebSocket error: #{e.message}"
 end
 
 # ---------------------------------------------------------------------------
@@ -1702,13 +1699,14 @@ module Chatbot
   class Session
     SYSTEM_PROMPT = "You are an automated crypto futures trading agent with institutional SMC expertise. " \
                     "Always fetch LIVE data — never make up prices or levels. " \
-                    "You have 22 tools organized into layers. USE THEM AUTONOMOUSLY in this order:\n" \
+                    "You have 28 tools organized into layers. USE THEM AUTONOMOUSLY in this order:\n" \
                     "\n" \
                     "1. MARKET ANALYSIS (always start here):\n" \
                     "   - analyze_multi_tf(symbol, trading_style) — PRIMARY: multi-timeframe trend, BOS/CHoCH, OBs, sweeps, PD\n" \
                     "   - find_smc_levels(symbol, interval) — single-TF deep dive\n" \
-                    "   - get_funding_rate(symbol) — market sentiment\n" \
-                    "   - get_open_interest(symbol) — trend confirmation\n" \
+                    "   - get_funding_rate(symbol) — market sentiment (Binance)\n" \
+                    "   - get_open_interest(symbol) — trend confirmation (Binance)\n" \
+                    "   - subscribe_market_data(symbol, channel, duration_sec) — real-time trades/klines/depth via WebSocket\n" \
                     "\n" \
                     "2. DEEP DIVE (call these after analyze_multi_tf for precision):\n" \
                     "   - analyze_market_structure(symbol, interval) — BOS/CHoCH, HH/LH/HL/LL, protected levels\n" \
@@ -1723,18 +1721,25 @@ module Chatbot
                     "   - risk_check(symbol, side, entry_price, quantity, stop_loss, leverage) — full risk assessment\n" \
                     "\n" \
                     "5. ACCOUNT STATE:\n" \
-                    "   - get_account_balance — available margin\n" \
-                    "   - get_positions(symbol) — open positions\n" \
-                    "   - get_open_orders(symbol) — pending orders\n" \
+                    "   - get_account_balance — Binance available margin\n" \
+                    "   - get_positions(symbol) — Binance open positions\n" \
+                    "   - get_open_orders(symbol) — Binance pending orders\n" \
+                    "   - coindcx_get_balance — CoinDCX asset balances\n" \
+                    "   - coindcx_get_positions(market) — CoinDCX positions\n" \
+                    "   - coindcx_get_open_orders(market) — CoinDCX pending orders\n" \
                     "\n" \
-                    "6. EXECUTION (only after user confirms):\n" \
-                    "   - set_leverage(symbol, leverage)\n" \
-                    "   - place_order — MARKET/LIMIT/STOP\n" \
-                    "   - cancel_order — by orderId\n" \
+                    "6. EXECUTION (CoinDCX is for trade execution; Binance for market data only):\n" \
+                    "   - coindcx_place_order(market, side, order_type, quantity, price?) — place on CoinDCX\n" \
+                    "   - coindcx_cancel_order(id, market) — cancel on CoinDCX\n" \
+                    "   - set_leverage(symbol, leverage) — set Binance leverage\n" \
+                    "   - place_order — Binance order (fallback)\n" \
+                    "   - cancel_order — Binance cancel (fallback)\n" \
                     "\n" \
                     "RULES:\n" \
                     " - When user asks about ANY crypto topic, run analyze_multi_tf + identify_trade_setup automatically.\n" \
                     " - Present the setup to the user with entry, SL, TP levels and R:R. Ask for confirmation.\n" \
+                    " - Use subscribe_market_data for entry timing (real-time tick precision).\n" \
+                    " - For execution, use CoinDCX tools (coindcx_*) by default. Binance tools are for market data only.\n" \
                     " - Never place an order without risk_check first and explicit user confirmation."
 
     def initialize(config)
@@ -1785,6 +1790,8 @@ module Chatbot
       ENV.delete("OLLAMA_AGENT_THINK")
       ENV["CHAT_BINANCE_API_KEY"] = config.binance_api_key if config.binance_api_key
       ENV["CHAT_BINANCE_API_SECRET"] = config.binance_api_secret if config.binance_api_secret
+      ENV["CHAT_COINDCX_API_KEY"] = config.coindcx_api_key if config.coindcx_api_key
+      ENV["CHAT_COINDCX_API_SECRET"] = config.coindcx_api_secret if config.coindcx_api_secret
     end
   end
 end
