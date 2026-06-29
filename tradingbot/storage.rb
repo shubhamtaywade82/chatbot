@@ -52,6 +52,7 @@ module TradingBot
           take_profit_3 REAL,
           rr_ratio REAL,
           reason TEXT,
+          raw_response TEXT,
           event_type TEXT,
           model_name TEXT,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -88,16 +89,39 @@ module TradingBot
           value TEXT NOT NULL
         );
       SQL
+
+      @db.execute("ALTER TABLE signals ADD COLUMN raw_response TEXT") rescue nil
+
+      @db.execute(<<~SQL)
+        CREATE TABLE IF NOT EXISTS llm_responses (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          symbol TEXT,
+          event_type TEXT,
+          prompt TEXT,
+          response TEXT NOT NULL,
+          parsed_action TEXT,
+          model_name TEXT,
+          duration_ms INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      SQL
+    end
+
+    def log_llm_response(symbol:, event_type:, prompt:, response:, parsed_action:, duration_ms:)
+      @db.execute(<<~SQL, [symbol, event_type, prompt, response, parsed_action, nil, duration_ms])
+        INSERT INTO llm_responses (symbol, event_type, prompt, response, parsed_action, model_name, duration_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      SQL
     end
 
     def log_signal(signal)
       @db.execute(<<~SQL, signal)
         INSERT INTO signals (symbol, direction, confidence, entry_price, stop_loss,
                              take_profit_1, take_profit_2, take_profit_3,
-                             rr_ratio, reason, event_type, model_name)
+                             rr_ratio, reason, raw_response, event_type, model_name)
         VALUES (:symbol, :direction, :confidence, :entry_price, :stop_loss,
                 :take_profit_1, :take_profit_2, :take_profit_3,
-                :rr_ratio, :reason, :event_type, :model_name)
+                :rr_ratio, :reason, :raw_response, :event_type, :model_name)
       SQL
       @db.last_insert_row_id
     end
@@ -144,6 +168,10 @@ module TradingBot
 
     def recent_signals(limit: 20)
       @db.execute("SELECT * FROM signals ORDER BY created_at DESC LIMIT ?", [limit])
+    end
+
+    def recent_llm_responses(limit: 20)
+      @db.execute("SELECT * FROM llm_responses ORDER BY created_at DESC LIMIT ?", [limit])
     end
 
     def log_event(symbol:, event_type:, timeframe: nil, price: nil, description:)
@@ -201,8 +229,9 @@ module TradingBot
       closed = @db.execute("SELECT COUNT(*) as c FROM trades WHERE status = 'closed'").first["c"]
       winners = @db.execute("SELECT COUNT(*) as c FROM trades WHERE status = 'closed' AND pnl > 0").first["c"]
       total_pnl = @db.execute("SELECT COALESCE(SUM(pnl), 0) as s FROM trades WHERE status = 'closed'").first["s"]
+      llm_calls = @db.execute("SELECT COUNT(*) as c FROM llm_responses").first["c"]
       { total_trades: trades, open_trades: open, closed_trades: closed,
-        winners: winners, total_pnl: total_pnl.round(2) }
+        winners: winners, total_pnl: total_pnl.round(2), llm_calls: llm_calls }
     end
   end
 end

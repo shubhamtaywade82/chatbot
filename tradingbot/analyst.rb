@@ -53,12 +53,18 @@ module TradingBot
 
     def analyze(symbol:, events:, multi_tf_data:, open_trades_count:)
       market_context = build_context(symbol, events, multi_tf_data, open_trades_count)
+      start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       response = @runner.run(market_context)
+      duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time) * 1000).to_i
       response_text = response.is_a?(Hash) ? (response[:content] || response["content"] || response.to_s) : response.to_s
-      parse_response(response_text, events)
+      parsed = parse_response(response_text, events)
+      parsed[:raw_response] = response_text
+      parsed[:prompt] = market_context
+      parsed[:duration_ms] = duration_ms
+      parsed
     rescue => e
       warn "Analyst error: #{e.message}" if @config.verbose?
-      { action: "wait", reason: "Analysis error: #{e.message}" }
+      { action: "wait", reason: "Analysis error: #{e.message}", raw_response: "Error: #{e.message}" }
     end
 
     private

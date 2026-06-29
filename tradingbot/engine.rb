@@ -104,6 +104,15 @@ module TradingBot
         open_trades_count: open_trades_count
       )
 
+      @storage.log_llm_response(
+        symbol: symbol,
+        event_type: events.first&.dig(:type)&.to_s || "periodic",
+        prompt: result[:prompt] || "",
+        response: result[:raw_response] || "",
+        parsed_action: result[:action],
+        duration_ms: result[:duration_ms] || 0
+      )
+
       if result[:action] == "trade"
         handle_trade_signal(symbol, result)
       elsif @config.verbose?
@@ -164,7 +173,8 @@ module TradingBot
         entry_price: signal[:entry_price], stop_loss: signal[:stop_loss],
         take_profit_1: signal[:take_profit_1], take_profit_2: signal[:take_profit_2],
         take_profit_3: signal[:take_profit_3], rr_ratio: signal[:rr_ratio],
-        reason: signal[:reason], event_type: signal[:event_type], model_name: @config.model
+        reason: signal[:reason], raw_response: signal[:raw_response],
+        event_type: signal[:event_type], model_name: @config.model
       )
 
       result = @trader.execute(signal)

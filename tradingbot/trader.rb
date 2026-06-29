@@ -1,4 +1,6 @@
-require_relative "../lib/chatbot/session"
+require "json"
+require "net/http"
+require "openssl"
 
 module TradingBot
   class Trader
