@@ -8,6 +8,8 @@ module Chatbot
                   :embedding_model, :conversation_persistence_path, :log_level,
                   :enable_streaming, :store_adapter
 
+    attr_accessor :binance_api_key, :binance_api_secret
+
     def initialize
       @base_url = ENV.fetch("CHAT_BASE_URL", "http://localhost:11434")
       @model = ENV.fetch("OLLAMA_MODEL", "qwen3.5:4b")
@@ -25,6 +27,8 @@ module Chatbot
       @log_level = ENV.fetch("CHAT_LOG_LEVEL", "info").to_sym
       @enable_streaming = true
       @store_adapter = :json
+      @binance_api_key = ENV["CHAT_BINANCE_API_KEY"]
+      @binance_api_secret = ENV["CHAT_BINANCE_API_SECRET"]
     end
 
     def cloud?

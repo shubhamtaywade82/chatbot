@@ -65,28 +65,115 @@ To add the same tool as a built-in in ollama_agent:
 
 ## Current Tools
 
+### Market Data (public — no auth)
+
 | Tool | What it does | When the model calls it |
 |------|-------------|------------------------|
 | `http_get` | Fetches any URL | Need live data from any public API |
 | `current_time` | Returns current datetime | Time, date, day-of-week queries |
 | `calculate` | Evaluates math expressions | Arithmetic, percentages, conversions |
-| `fetch_klines` | OHLCV candlesticks from Binance | Chart patterns, trend analysis, indicator calc |
-| `fetch_ticker` | 24h stats from Binance | Current price snapshot, momentum check |
-| `fetch_orderbook` | Order book depth from Binance | Liquidity levels, support/resistance walls |
-| `find_smc_levels` | Full SMC analysis | Trade entry analysis, SMC concepts |
+| `fetch_klines` | OHLCV candlesticks from Binance Spot | Chart patterns, trend analysis, indicator calc |
+| `fetch_ticker` | 24h stats from Binance Spot | Current price snapshot, momentum check |
+| `fetch_orderbook` | Order book depth from Binance Spot | Liquidity levels, support/resistance walls |
+| `find_smc_levels` | Full SMC analysis (Spot klines) | Trade entry analysis, SMC concepts |
 
-### Tool Patterns
+### Futures Analysis (public — no auth)
 
-**Raw data tools** (`fetch_klines`, `fetch_ticker`, `fetch_orderbook`):
-- Fetch from Binance public API (no auth)
+| Tool | What it does | When the model calls it |
+|------|-------------|------------------------|
+| `get_funding_rate` | Current + historical funding rates | Assess sentiment, cost of holding |
+| `get_open_interest` | Open interest (current + 24h trend) | Confirm trend strength, detect reversals |
+
+### Account & Position Management (requires API key)
+
+| Tool | What it does | When the model calls it |
+|------|-------------|------------------------|
+| `get_account_balance` | Wallet balance, available margin per asset | Check available funds before trading |
+| `get_positions` | Open positions: entry, liq price, PnL, leverage | Review current exposure |
+| `get_open_orders` | List pending orders | Find order IDs, check what's queued |
+| `set_leverage` | Set leverage per pair (1-125x) | Before placing a trade |
+
+### Trade Execution (requires API key)
+
+| Tool | What it does | When the model calls it |
+|------|-------------|------------------------|
+| `place_order` | Place MARKET/LIMIT/STOP/TP order | **Only after user confirms** trade details |
+| `cancel_order` | Cancel an open order by symbol + orderId | Remove stale/mistaken orders |
+
+### Risk Management (requires API key)
+
+| Tool | What it does | When the model calls it |
+|------|-------------|------------------------|
+| `position_sizing` | Calculate position size from risk %, entry, stop | **Before** place_order to determine quantity |
+| `risk_check` | Full risk assessment of proposed trade | **Before** place_order to validate safety |
+
+## Tool Patterns
+
+**Raw data tools** (`fetch_klines`, `fetch_ticker`, `fetch_orderbook`, `get_funding_rate`, `get_open_interest`):
+- Fetch from Binance API (public endpoints, no auth needed for Futures analysis tools)
 - Parse JSON, extract relevant fields
 - Return formatted string
 
 **Compound analysis tools** (`find_smc_levels`):
-- Fetch raw data internally
+- Fetch raw data internally (klines + order book)
 - Apply algorithmic analysis (swing points, order blocks, FVGs)
 - Return structured analysis with current price, trend, levels, and trade bias
 - One tool call = complete analysis (reduces model turn count)
+
+**State tools** (`get_account_balance`, `get_positions`, `get_open_orders`):
+- Call Binance Futures signed endpoints (HMAC SHA256)
+- Used by the model to understand current portfolio state
+- Never modify state
+
+**Execution tools** (`place_order`, `cancel_order`, `set_leverage`):
+- Modify state on Binance Futures
+- `place_order` system prompt instructs the model to **always** present trade details and ask for user confirmation before executing
+
+**Risk tools** (`position_sizing`, `risk_check`):
+- Pure computation layered on account state
+- Enforce position limits (max 2% risk per trade warning)
+- Must be called before `place_order`
+
+## Binance Futures API Authentication
+
+Tools that require auth read credentials from environment variables:
+
+```bash
+export CHAT_BINANCE_API_KEY="your_binance_api_key"
+export CHAT_BINANCE_API_SECRET="your_binance_api_secret"
+```
+
+Or add to `config/config.rb` — the `Config` class reads these from ENV and `Session#set_ollama_env` forwards them as env vars for tool handlers.
+
+The signing uses HMAC SHA256:
+
+```ruby
+# In BinanceFutures.signed_request:
+query = params.sort.map { |k, v| "#{k}=#{v}" }.join("&")
+signature = OpenSSL::HMAC.hexdigest("SHA256", secret, query)
+```
+
+API key requirements (Binance Futures):
+- Enable Futures trading on the API key
+- Permissions: enable "Futures" (Enable Trading + Enable Withdrawals optional)
+- Never share or commit your API secret
+
+## Tool Workflow for Automated Trading
+
+```
+User: "analysis + trade suggestion"
+  → find_smc_levels (trend, OBs, FVGs)
+  → get_funding_rate (sentiment)
+  → get_open_interest (trend confirmation)
+  → position_sizing (calculate quantity)
+  → risk_check (validate the trade)
+  → Present to user: "Here's the setup. Confirm?"
+  
+User: "confirm"
+  → set_leverage
+  → place_order
+  → get_positions (verify fill)
+```
 
 ## Model Compatibility
 
@@ -97,14 +184,6 @@ To add the same tool as a built-in in ollama_agent:
 | qwen3.5:9.7b | Excellent | Best for complex multi-tool analysis |
 | llama3.1:8b | Poor | Hallucinates parameter names, calls tools for "hello" |
 | llama3.2:3b | Unusable | Too small for tool calling |
-
-## Passing the Binance API URL
-
-```ruby
-BINANCE_API = "https://api.binance.com"
-```
-
-This is defined once at module level in `session.rb`. All market tools use it. If you need a different exchange, add a `base_url` parameter to the tool.
 
 ## Error Handling Pattern
 

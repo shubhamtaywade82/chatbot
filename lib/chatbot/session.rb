@@ -2,6 +2,7 @@ require "securerandom"
 require "net/http"
 require "uri"
 require "json"
+require "openssl"
 require "ollama_agent"
 
 # Return only custom tools — no built-in coding tools
@@ -378,13 +379,500 @@ rescue => e
   "Error: #{e.message}"
 end
 
+# ---------------------------------------------------------------------------
+# Binance Futures API helper — HMAC SHA256 signed requests
+# ---------------------------------------------------------------------------
+BINANCE_FUTURES = "https://fapi.binance.com"
+
+module BinanceFutures
+  def self.signed_request(method, path, params = {})
+    key = ENV["CHAT_BINANCE_API_KEY"].to_s.strip
+    secret = ENV["CHAT_BINANCE_API_SECRET"].to_s.strip
+    return { error: "Binance API key not configured. Set CHAT_BINANCE_API_KEY and CHAT_BINANCE_API_SECRET." }.to_s if key.empty? || secret.empty?
+
+    params[:timestamp] = (Time.now.to_f * 1000).to_i
+    params[:recvWindow] = 5000
+    query = params.sort.map { |k, v| "#{k}=#{v}" }.join("&")
+    signature = OpenSSL::HMAC.hexdigest("SHA256", secret, query)
+    uri = URI("#{BINANCE_FUTURES}#{path}?#{query}&signature=#{signature}")
+
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.open_timeout = 10
+    http.read_timeout = 10
+
+    req = case method
+          when :post   then Net::HTTP::Post.new(uri)
+          when :delete then Net::HTTP::Delete.new(uri)
+          else              Net::HTTP::Get.new(uri)
+          end
+    req["X-MBX-APIKEY"] = key
+
+    JSON.parse(http.request(req).body)
+  rescue => e
+    { error: e.message }
+  end
+
+  def self.public_get(path, params = {})
+    uri = URI("#{BINANCE_FUTURES}#{path}")
+    uri.query = URI.encode_www_form(params) unless params.empty?
+    JSON.parse(Net::HTTP.get(uri))
+  rescue => e
+    { error: e.message }
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Trading execution tools — Binance Futures (requires API key)
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("get_account_balance", schema: {
+  description: "Get Binance Futures account balance and margin information. " \
+               "Returns available balance, wallet balance, cross wallet balance, and margin info per asset. " \
+               "Use before trading to verify available funds.",
+  parameters: {
+    type: "object",
+    properties: {},
+    required: []
+  }
+}) do |args, **|
+  data = BinanceFutures.signed_request(:get, "/fapi/v2/account")
+  next data.to_s if data.is_a?(Hash) && data[:error]
+
+  assets = (data["assets"] || []).map do |a|
+    {
+      asset: a["asset"],
+      wallet_balance: a["walletBalance"].to_f,
+      cross_wallet: a["crossWalletBalance"].to_f,
+      available: a["availableBalance"].to_f,
+      margin: a["marginBalance"].to_f
+    }
+  end
+  { assets: assets, total_wallet: assets.sum { |a| a[:wallet_balance] } }.to_s
+end
+
+OllamaAgent::Tools.register("get_positions", schema: {
+  description: "Get all open positions for Binance Futures. " \
+               "Returns entry price, liquidation price, unrealized PnL, leverage, position size, and margin. " \
+               "Use to check current exposure before opening new trades.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'. Optional — omit to get all positions."
+      }
+    },
+    required: []
+  }
+}) do |args, **|
+  params = {}
+  symbol = args["symbol"].to_s.strip.upcase
+  params[:symbol] = symbol unless symbol.empty?
+  data = BinanceFutures.signed_request(:get, "/fapi/v2/positionRisk", params)
+  next data.to_s if data.is_a?(Hash) && data[:error]
+
+  positions = (data.is_a?(Array) ? data : [data]).select { |p| p["positionAmt"].to_f != 0 }
+  next "No open positions." if positions.empty?
+
+  positions.map do |p|
+    {
+      symbol: p["symbol"],
+      side: p["positionAmt"].to_f > 0 ? "LONG" : "SHORT",
+      size: p["positionAmt"].to_f.abs,
+      entry_price: p["entryPrice"].to_f,
+      mark_price: p["markPrice"].to_f,
+      liquidation_price: p["liquidationPrice"].to_f,
+      leverage: p["leverage"].to_f,
+      unrealized_pnl: p["unRealizedProfit"].to_f,
+      margin: p["isolatedMargin"].to_f
+    }
+  end.to_s
+end
+
+OllamaAgent::Tools.register("set_leverage", schema: {
+  description: "Set leverage for a Binance Futures trading pair. " \
+               "Always call this before placing a trade to ensure correct leverage. " \
+               "Max leverage depends on the symbol and your account tier.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      leverage: {
+        type: "integer",
+        description: "Leverage value (1-125 depending on symbol)"
+      }
+    },
+    required: ["symbol", "leverage"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  leverage = args["leverage"].to_i
+  data = BinanceFutures.signed_request(:post, "/fapi/v1/leverage", symbol: symbol, leverage: leverage)
+  data.to_s
+end
+
+OllamaAgent::Tools.register("place_order", schema: {
+  description: "Place an order on Binance Futures. Supports MARKET, LIMIT, STOP, TAKE_PROFIT orders. " \
+               "⚠️ ONLY call this when the user explicitly confirms they want to execute a trade. " \
+               "Always present the trade details first and ask for confirmation. " \
+               "For MARKET orders, price is not needed. For LIMIT orders, price is required.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      side: {
+        type: "string",
+        enum: ["BUY", "SELL"],
+        description: "BUY for long, SELL for short"
+      },
+      type: {
+        type: "string",
+        enum: ["MARKET", "LIMIT", "STOP", "STOP_MARKET", "TAKE_PROFIT", "TAKE_PROFIT_MARKET"],
+        description: "Order type. MARKET = execute immediately at best price. LIMIT = set a specific price."
+      },
+      quantity: {
+        type: "number",
+        description: "Position size in base asset units (e.g. 0.5 SOL). Use position_sizing tool to calculate."
+      },
+      price: {
+        type: "number",
+        description: "Limit price (required for LIMIT, STOP, TAKE_PROFIT orders). Not used for MARKET."
+      },
+      stopPrice: {
+        type: "number",
+        description: "Stop trigger price (required for STOP orders only)"
+      },
+      reduceOnly: {
+        type: "boolean",
+        description: "If true, the order will only reduce an existing position. Use for stop losses."
+      },
+      timeInForce: {
+        type: "string",
+        enum: ["GTC", "IOC", "FOK"],
+        description: "GTC = Good till cancelled, IOC = Immediate or Cancel, FOK = Fill or Kill (default: GTC)"
+      }
+    },
+    required: ["symbol", "side", "type", "quantity"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  side = args["side"].to_s.upcase.strip
+  type = args["type"].to_s.upcase.strip
+  quantity = args["quantity"].to_s
+
+  params = { symbol: symbol, side: side, type: type, quantity: quantity }
+  params[:price] = args["price"].to_s if args["price"]
+  params[:stopPrice] = args["stopPrice"].to_s if args["stopPrice"]
+  params[:reduceOnly] = true if args["reduceOnly"]
+  params[:timeInForce] = args["timeInForce"] if args["timeInForce"]
+
+  data = BinanceFutures.signed_request(:post, "/fapi/v1/order", params)
+  data.to_s
+end
+
+OllamaAgent::Tools.register("cancel_order", schema: {
+  description: "Cancel an open order on Binance Futures by symbol and order ID.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      orderId: {
+        type: "integer",
+        description: "Order ID to cancel (from get_open_orders)"
+      }
+    },
+    required: ["symbol", "orderId"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  order_id = args["orderId"].to_i
+  data = BinanceFutures.signed_request(:delete, "/fapi/v1/order", symbol: symbol, orderId: order_id)
+  data.to_s
+end
+
+OllamaAgent::Tools.register("get_open_orders", schema: {
+  description: "List all open orders on Binance Futures. " \
+               "Use to check pending orders before placing new ones or to find order IDs to cancel.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'. Optional — omit to get all open orders."
+      }
+    },
+    required: []
+  }
+}) do |args, **|
+  params = {}
+  symbol = args["symbol"].to_s.strip.upcase
+  params[:symbol] = symbol unless symbol.empty?
+  data = BinanceFutures.signed_request(:get, "/fapi/v1/openOrders", params)
+  data.to_s
+end
+
+OllamaAgent::Tools.register("get_funding_rate", schema: {
+  description: "Get current and historical funding rates for a Binance Futures pair. " \
+               "Positive funding = longs pay shorts (bearish sentiment). " \
+               "Negative funding = shorts pay longs (bullish sentiment). " \
+               "Use to assess market sentiment and cost of holding positions overnight.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      limit: {
+        type: "integer",
+        description: "Number of records to return (default: 5, max: 1000)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  limit = args["limit"] || 5
+  data = BinanceFutures.public_get("/fapi/v1/fundingRate", symbol: symbol, limit: limit)
+  next data.to_s if data.is_a?(Hash) && data[:error]
+
+  # Also get predicted funding rate
+  premium = BinanceFutures.public_get("/fapi/v1/premiumIndex", symbol: symbol)
+  predicted = premium.is_a?(Hash) ? premium["lastFundingRate"] : nil
+
+  rates = (data.is_a?(Array) ? data : []).map do |r|
+    {
+      time: Time.at(r["fundingTime"].to_i / 1000).utc.strftime("%Y-%m-%d %H:%M"),
+      rate: (r["fundingRate"].to_f * 100).round(4).to_s + "%"
+    }
+  end
+  {
+    symbol: symbol,
+    current_rate: (premium.is_a?(Hash) ? premium["lastFundingRate"].to_f * 100 : nil)&.round(4)&.to_s + "%",
+    predicted_rate: predicted ? (predicted.to_f * 100).round(4).to_s + "%" : "N/A",
+    countdown_to_next: premium.is_a?(Hash) ? "#{((premium["countDownTime"].to_i / 1000) / 3600).round(1)}h" : "N/A",
+    history: rates
+  }.to_s
+end
+
+OllamaAgent::Tools.register("get_open_interest", schema: {
+  description: "Get current open interest for a Binance Futures trading pair. " \
+               "High and rising OI confirms trend strength. " \
+               "High and falling OI suggests trend weakening / liquidation cascade. " \
+               "Use alongside SMC analysis for confluence.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  oi = BinanceFutures.public_get("/fapi/v1/openInterest", symbol: symbol)
+  oi_hist = BinanceFutures.public_get("/fapi/v1/openInterestHist", symbol: symbol, period: "1h", limit: 24)
+  current = oi.is_a?(Hash) ? oi["openInterest"].to_f : nil
+  history = (oi_hist.is_a?(Array) ? oi_hist : []).map { |h| { time: h["timestamp"], oi: h["sumOpenInterest"].to_f } }
+  change_24h = history.size >= 2 ? ((history.last[:oi] - history.first[:oi]) / history.first[:oi] * 100).round(2) : nil
+  {
+    symbol: symbol,
+    current_open_interest: current,
+    change_24h_percent: change_24h,
+    note: change_24h && change_24h > 10 ? "OI rising significantly — strong trend" :
+          change_24h && change_24h < -10 ? "OI dropping — possible reversal" :
+          "OI stable — trend confirmation needed"
+  }.to_s
+end
+
+# ---------------------------------------------------------------------------
+# Risk management tools
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("position_sizing", schema: {
+  description: "Calculate the optimal position size for a trade based on risk percentage and stop loss. " \
+               "Use this BEFORE place_order to determine how many units to trade. " \
+               "Risk 1-2% per trade as a general rule.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      entry_price: {
+        type: "number",
+        description: "Planned entry price for the trade"
+      },
+      stop_loss: {
+        type: "number",
+        description: "Stop loss price"
+      },
+      risk_percent: {
+        type: "number",
+        description: "Percentage of available balance to risk (e.g. 1.0 = 1%%, 2.0 = 2%%). Default: 1.0"
+      },
+      leverage: {
+        type: "integer",
+        description: "Leverage to use (default: 1)"
+      }
+    },
+    required: ["symbol", "entry_price", "stop_loss"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  entry = args["entry_price"].to_f
+  stop = args["stop_loss"].to_f
+  risk_pct = (args["risk_percent"] || 1.0).to_f
+  lev = (args["leverage"] || 1).to_i
+  lev = 1 if lev < 1
+
+  # Get available balance
+  acct = BinanceFutures.signed_request(:get, "/fapi/v2/account")
+  next "Error: cannot fetch account" if acct.is_a?(Hash) && acct[:error]
+
+  balance = (acct["assets"] || []).find { |a| a["asset"] == "USDT" }
+  next "Error: USDT balance not found" unless balance
+
+  available = balance["availableBalance"].to_f
+  risk_amount = available * (risk_pct / 100.0) * lev
+  price_diff = (entry - stop).abs
+  quantity = price_diff > 0 ? (risk_amount / price_diff).round(3) : 0
+
+  # Get step size / lot size filter for precision
+  info = BinanceFutures.public_get("/fapi/v1/exchangeInfo")
+  symbol_info = (info["symbols"] || []).find { |s| s["symbol"] == symbol } if info.is_a?(Hash)
+  filters = (symbol_info["filters"] || []) if symbol_info
+  lot_size = filters.find { |f| f["filterType"] == "LOT_SIZE" } if filters
+  step_size = lot_size ? lot_size["stepSize"].to_f : 0.001
+  precision = step_size > 0 ? [Math.log10(1.0 / step_size).ceil, 0].max : 3
+  quantity = (quantity / step_size).floor * step_size if step_size > 0
+
+  {
+    symbol: symbol,
+    available_balance: available,
+    risk_percent: risk_pct,
+    risk_amount_usdt: (risk_amount / lev).round(2),
+    leverage: lev,
+    quantity: quantity.round(precision),
+    entry_price: entry,
+    stop_loss: stop,
+    stop_distance_percent: (price_diff / entry * 100).round(2),
+    max_loss_usdt: (quantity * price_diff / lev).round(2)
+  }.to_s
+end
+
+OllamaAgent::Tools.register("risk_check", schema: {
+  description: "Analyze the risk of a proposed trade before execution. " \
+               "Checks current positions, available margin, distance to liquidation, " \
+               "and portfolio exposure. Call this BEFORE place_order when the user requests a trade. " \
+               "If risk is acceptable, ask the user to confirm before placing the order.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      side: {
+        type: "string",
+        enum: ["BUY", "SELL"],
+        description: "BUY for long, SELL for short"
+      },
+      entry_price: {
+        type: "number",
+        description: "Planned entry price"
+      },
+      quantity: {
+        type: "number",
+        description: "Planned position size in base asset units"
+      },
+      stop_loss: {
+        type: "number",
+        description: "Stop loss price"
+      },
+      leverage: {
+        type: "integer",
+        description: "Leverage to use"
+      }
+    },
+    required: ["symbol", "side", "entry_price", "quantity", "stop_loss", "leverage"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  side = args["side"].to_s.upcase.strip
+  entry = args["entry_price"].to_f
+  qty = args["quantity"].to_f
+  sl = args["stop_loss"].to_f
+  lev = args["leverage"].to_i
+  lev = 1 if lev < 1
+
+  acct = BinanceFutures.signed_request(:get, "/fapi/v2/account")
+  next "Error: cannot fetch account" if acct.is_a?(Hash) && acct[:error]
+
+  balance = (acct["assets"] || []).find { |a| a["asset"] == "USDT" }
+  next "Error: USDT balance not found" unless balance
+
+  available = balance["availableBalance"].to_f
+  wallet = balance["walletBalance"].to_f
+  positions = (BinanceFutures.signed_request(:get, "/fapi/v2/positionRisk") rescue [])
+  existing = (positions.is_a?(Array) ? positions : []).select { |p| p["symbol"] == symbol && p["positionAmt"].to_f != 0 }
+
+  position_value = entry * qty
+  margin_used = position_value / lev
+  risk_per_trade = ((entry - sl).abs * qty) / lev
+  risk_pct = available > 0 ? (risk_per_trade / available * 100).round(2) : 0
+
+  # Estimate liquidation price (simplified: cross-margin)
+  liq_price = side == "BUY" ? entry - (entry / lev) : entry + (entry / lev)
+
+  warnings = []
+  warnings << "⚠️ Risking #{risk_pct}% of available balance (recommended max: 2%)" if risk_pct > 2
+  warnings << "⚠️ High leverage (#{lev}x)" if lev > 10
+  warnings << "⚠️ Existing position in #{symbol}" unless existing.empty?
+  warnings << "⚠️ Insufficient balance (#{available.round(2)} USDT available, need #{margin_used.round(2)})" if margin_used > available
+
+  {
+    symbol: symbol,
+    side: side,
+    assessment: warnings.empty? ? "✅ Trade risk is acceptable" : "⚠️ Review warnings",
+    available_balance: available.round(2),
+    wallet_balance: wallet.round(2),
+    position_value: position_value.round(2),
+    margin_required: margin_used.round(2),
+    margin_used_percent: (margin_used / [wallet, 1].max * 100).round(2),
+    risk_per_trade_usdt: risk_per_trade.round(2),
+    risk_percent_of_balance: risk_pct,
+    estimated_liquidation_price: liq_price.round(2),
+    distance_to_liquidation: "#{((entry - liq_price).abs / entry * 100).round(2)}%",
+    stop_loss_percent: ((entry - sl).abs / entry * 100).round(2),
+    warnings: warnings
+  }.to_s
+end
+
+# ---------------------------------------------------------------------------
+# Session — orchestrates config + runner + env
+# ---------------------------------------------------------------------------
 module Chatbot
   class Session
-    SYSTEM_PROMPT = "You are a crypto trading analyst with Smart Money Concepts (SMC) expertise. " \
+    SYSTEM_PROMPT = "You are an automated crypto futures trading agent with SMC expertise. " \
                     "Always fetch LIVE data — never make up prices or levels. " \
-                    "Tools: fetch_klines (candlesticks), fetch_ticker (24h stats), " \
-                    "fetch_orderbook (order book depth), find_smc_levels (full SMC analysis), " \
-                    "http_get (any URL), current_time, calculate."
+                    "Analyze with: find_smc_levels, fetch_klines, fetch_ticker, fetch_orderbook, " \
+                    "get_funding_rate, get_open_interest. " \
+                    "Manage risk with: position_sizing, risk_check. " \
+                    "Check state: get_account_balance, get_positions, get_open_orders. " \
+                    "Execute only after user confirms: set_leverage, place_order, cancel_order. " \
+                    "Never place an order without risk_check first and user confirmation."
 
     def initialize(config)
       @config = config
@@ -432,6 +920,8 @@ module Chatbot
       ENV["OLLAMA_AGENT_SKILLS"] = "0"
       ENV["OLLAMA_AGENT_EXTERNAL_SKILLS"] = "0"
       ENV.delete("OLLAMA_AGENT_THINK")
+      ENV["CHAT_BINANCE_API_KEY"] = config.binance_api_key if config.binance_api_key
+      ENV["CHAT_BINANCE_API_SECRET"] = config.binance_api_secret if config.binance_api_secret
     end
   end
 end
