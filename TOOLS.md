@@ -75,7 +75,8 @@ To add the same tool as a built-in in ollama_agent:
 | `fetch_klines` | OHLCV candlesticks from Binance Spot | Chart patterns, trend analysis, indicator calc |
 | `fetch_ticker` | 24h stats from Binance Spot | Current price snapshot, momentum check |
 | `fetch_orderbook` | Order book depth from Binance Spot | Liquidity levels, support/resistance walls |
-| `find_smc_levels` | Full SMC analysis (Spot klines) | Trade entry analysis, SMC concepts |
+| `find_smc_levels` | SMC analysis on one timeframe (Spot klines) | Single-TF check, quick trend read |
+| `analyze_multi_tf` | **Multi-timeframe SMC** with trading style support | **Primary entry tool** — replaces multiple find_smc_levels calls |
 
 ### Futures Analysis (public — no auth)
 
@@ -107,6 +108,22 @@ To add the same tool as a built-in in ollama_agent:
 | `position_sizing` | Calculate position size from risk %, entry, stop | **Before** place_order to determine quantity |
 | `risk_check` | Full risk assessment of proposed trade | **Before** place_order to validate safety |
 
+## Trading Styles & Timeframes
+
+The `analyze_multi_tf` tool maps trading styles to optimal timeframes:
+
+| Style | Entry TF | Trend TF | Macro TF | Holding Period |
+|-------|----------|----------|----------|----------------|
+| `scalping` | 1m | 5m | — | Seconds–minutes |
+| `intraday` | 15m | 1h | — | Minutes–hours |
+| `swing` | 1h | 4h | 1d | Hours–days |
+| `positional` | 4h | 1d | 1w | Days–weeks |
+
+Each style analyzes 2-3 timeframes and reports:
+- **Per timeframe**: trend, last swing high/low, order blocks, FVGs
+- **Confluence**: do all timeframes agree on direction?
+- **Bias**: specific trade recommendation based on alignment
+
 ## Tool Patterns
 
 **Raw data tools** (`fetch_klines`, `fetch_ticker`, `fetch_orderbook`, `get_funding_rate`, `get_open_interest`):
@@ -114,11 +131,12 @@ To add the same tool as a built-in in ollama_agent:
 - Parse JSON, extract relevant fields
 - Return formatted string
 
-**Compound analysis tools** (`find_smc_levels`):
-- Fetch raw data internally (klines + order book)
+**Compound analysis tools** (`find_smc_levels`, `analyze_multi_tf`):
+- Fetch raw data internally (klines + optionally order book)
 - Apply algorithmic analysis (swing points, order blocks, FVGs)
 - Return structured analysis with current price, trend, levels, and trade bias
-- One tool call = complete analysis (reduces model turn count)
+- `analyze_multi_tf` runs SMC across 2-3 timeframes and computes confluence
+- One tool call = complete multi-TF analysis (reduces model turn count)
 
 **State tools** (`get_account_balance`, `get_positions`, `get_open_orders`):
 - Call Binance Futures signed endpoints (HMAC SHA256)
@@ -161,9 +179,9 @@ API key requirements (Binance Futures):
 ## Tool Workflow for Automated Trading
 
 ```
-User: "analysis + trade suggestion"
-  → find_smc_levels (trend, OBs, FVGs)
-  → get_funding_rate (sentiment)
+User: "Swing trade SOLUSDT"
+  → analyze_multi_tf(symbol=SOLUSDT, trading_style=swing)
+  → get_funding_rate (sentiment check)
   → get_open_interest (trend confirmation)
   → position_sizing (calculate quantity)
   → risk_check (validate the trade)

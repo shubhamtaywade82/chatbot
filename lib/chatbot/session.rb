@@ -242,14 +242,114 @@ rescue => e
 end
 
 # ---------------------------------------------------------------------------
-# SMC Analysis tool — computes Smart Money Concepts levels from live data
+# SMC analysis engine — reusable across single-TF and multi-TF tools
+# ---------------------------------------------------------------------------
+module SMC
+  # Fetch klines from Binance Spot and parse into candle hashes
+  def self.fetch_candles(symbol, interval, limit: 150)
+    url = "#{BINANCE_API}/api/v3/klines?symbol=#{symbol}&interval=#{interval}&limit=#{limit}"
+    raw = JSON.parse(Net::HTTP.get(URI(url)))
+    raw.map do |k|
+      {
+        time: k[0] / 1000,
+        open: k[1].to_f, high: k[2].to_f, low: k[3].to_f, close: k[4].to_f,
+        volume: k[5].to_f
+      }
+    end
+  end
+
+  # Analyze candles and return structured SMC hash
+  def self.analyze(candles, symbol, interval)
+    # Market structure: find swing highs/lows
+    swings = []
+    candles.each_cons(3) do |prev, cur, nxt|
+      swings << { type: "swing_high", price: cur[:high] } if cur[:high] > prev[:high] && cur[:high] > nxt[:high]
+      swings << { type: "swing_low",  price: cur[:low] }  if cur[:low]  < prev[:low]  && cur[:low]  < nxt[:low]
+    end
+
+    recent_highs = swings.select { |s| s[:type] == "swing_high" }.last(5).map { |s| s[:price] }
+    recent_lows  = swings.select { |s| s[:type] == "swing_low"  }.last(5).map { |s| s[:price] }
+
+    trend = if recent_highs.size >= 2 && recent_lows.size >= 2
+      if recent_highs[-1] > recent_highs[-2] && recent_lows[-1] > recent_lows[-2]
+        "uptrend"
+      elsif recent_highs[-1] < recent_highs[-2] && recent_lows[-1] < recent_lows[-2]
+        "downtrend"
+      else
+        "ranging"
+      end
+    else
+      "insufficient_data"
+    end
+
+    # Order blocks: candle before a strong impulsive move
+    order_blocks = []
+    candles.each_cons(2) do |prev, cur|
+      body_prev = (prev[:close] - prev[:open]).abs
+      body_cur  = (cur[:close] - cur[:open]).abs
+      range_cur = (cur[:high] - cur[:low]).abs
+      if range_cur > 0 && body_cur / range_cur > 0.6 && body_cur > body_prev * 1.5
+        direction = cur[:close] > cur[:open] ? "bullish" : "bearish"
+        order_blocks << {
+          direction: direction,
+          zone: direction == "bullish" ? [prev[:low], prev[:high]] : [prev[:high], prev[:low]],
+          strength: body_cur > body_prev * 2.5 ? "strong" : "moderate"
+        }
+      end
+    end
+
+    # Fair Value Gaps: 3-candle imbalance
+    fvgs = []
+    candles.each_cons(3) do |c1, c2, c3|
+      if c2[:high] < c3[:low]
+        fvgs << { type: "bullish_fvg", zone: [c2[:high], c3[:low]] }
+      elsif c2[:low] > c1[:high]
+        fvgs << { type: "bearish_fvg", zone: [c1[:high], c2[:low]] }
+      end
+    end
+
+    last = candles.last
+    current_price = last[:close]
+
+    {
+      symbol: symbol,
+      interval: interval,
+      current_price: current_price,
+      candles_count: candles.size,
+      market_structure: {
+        trend: trend,
+        last_swing_high: recent_highs.last,
+        last_swing_low: recent_lows.last
+      },
+      key_levels: {
+        resistance: recent_highs.last(3),
+        support: recent_lows.last(3)
+      },
+      order_blocks: order_blocks.last(5).map { |ob|
+        dir_icon = ob[:direction] == "bullish" ? "🟢" : "🔴"
+        zone_str = "$#{ob[:zone].min} - $#{ob[:zone].max}"
+        "#{dir_icon} #{ob[:direction]} OB #{zone_str} (#{ob[:strength]})"
+      },
+      fair_value_gaps: fvgs.last(5).map { |fg|
+        type_icon = fg[:type] == "bullish_fvg" ? "🟢" : "🔴"
+        "#{type_icon} #{fg[:type]} $#{fg[:zone].min} - $#{fg[:zone].max}"
+      },
+      trade_bias: case trend
+      when "uptrend" then "Bullish"
+      when "downtrend" then "Bearish"
+      else "Neutral"
+      end
+    }
+  end
+end
+
+# ---------------------------------------------------------------------------
+# SMC single-timeframe tool
 # ---------------------------------------------------------------------------
 OllamaAgent::Tools.register("find_smc_levels", schema: {
-  description: "Perform Smart Money Concepts (SMC) analysis on a trading pair. " \
-               "Automatically fetches live klines and computes: market structure (trend), " \
-               "swing highs/lows, order blocks (institutional entry zones), " \
-               "fair value gaps (FVGs), and key support/resistance levels. " \
-               "Use this as the primary tool for trade entry analysis.",
+  description: "Perform Smart Money Concepts (SMC) analysis on one timeframe. " \
+               "Returns trend, swing-highs/lows, order blocks, and fair value gaps. " \
+               "For a complete picture across multiple timeframes use analyze_multi_tf.",
   parameters: {
     type: "object",
     properties: {
@@ -259,122 +359,130 @@ OllamaAgent::Tools.register("find_smc_levels", schema: {
       },
       interval: {
         type: "string",
-        description: "Candle interval for analysis: 1h, 4h, 1d (default: 1h)"
+        description: "Candle interval: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (default: 1h)"
       }
     },
     required: ["symbol"]
   }
-}) do |args, root:, read_only:|
+}) do |args, **|
   symbol = args["symbol"].to_s.upcase.strip
   interval = args["interval"] || "1h"
+  candles = SMC.fetch_candles(symbol, interval)
+  result = SMC.analyze(candles, symbol, interval)
+  result[:timestamp] = Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")
+  result.to_s
+rescue => e
+  "Error: #{e.message}"
+end
 
-  # Fetch klines
-  url = "#{BINANCE_API}/api/v3/klines?symbol=#{symbol}&interval=#{interval}&limit=150"
-  raw = JSON.parse(Net::HTTP.get(URI(url)))
-  candles = raw.map do |k|
-    {
-      time: k[0] / 1000,
-      open: k[1].to_f, high: k[2].to_f, low: k[3].to_f, close: k[4].to_f,
-      volume: k[5].to_f, close_time: k[6] / 1000
-    }
+# ---------------------------------------------------------------------------
+# Multi-timeframe analysis + trading style support
+# ---------------------------------------------------------------------------
+TRADING_STYLES = {
+  "scalping"   => { entry: "1m",  trend: "5m",  label: "Scalping (seconds-minutes)" },
+  "intraday"   => { entry: "15m", trend: "1h",  label: "Intraday (minutes-hours)" },
+  "swing"      => { entry: "1h",  trend: "4h",  macro: "1d",  label: "Swing (hours-days)" },
+  "positional" => { entry: "4h",  trend: "1d",  macro: "1w",  label: "Positional (days-weeks)" }
+}.freeze
+
+OllamaAgent::Tools.register("analyze_multi_tf", schema: {
+  description: "Multi-timeframe SMC analysis with trading style support. " \
+               "Automatically selects the right timeframes for your style: " \
+               "scalping (1m/5m), intraday (15m/1h), swing (1h/4h/1d), positional (4h/1d/1w). " \
+               "For each timeframe returns trend, order blocks, and FVGs. " \
+               "Provides confluence assessment and specific trade setup recommendations. " \
+               "Use this as the primary entry analysis tool — it replaces multiple find_smc_levels calls.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT', 'BTCUSDT'"
+      },
+      trading_style: {
+        type: "string",
+        enum: ["scalping", "intraday", "swing", "positional"],
+        description: "Your trading style. Determines which timeframes are analyzed. (default: swing)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  style = (args["trading_style"] || "swing").to_s.downcase.strip
+  tf = TRADING_STYLES[style]
+  next "Unknown style: #{style}. Choose: scalping, intraday, swing, positional" unless tf
+
+  # Fetch + analyze each timeframe
+  levels = {}
+  tfs = [tf[:entry], tf[:trend]]
+  tfs << tf[:macro] if tf[:macro]
+
+  tfs.each do |interval|
+    candles = SMC.fetch_candles(symbol, interval, limit: 100)
+    levels[interval] = SMC.analyze(candles, symbol, interval)
   end
 
-  # --- Market structure: find swing highs/lows ---
-  swings = []
-  candles.each_cons(3) do |prev, cur, nxt|
-    swings << { type: "swing_high", price: cur[:high], time: Time.at(cur[:time]).utc.strftime("%H:%M %m/%d") } if cur[:high] > prev[:high] && cur[:high] > nxt[:high]
-    swings << { type: "swing_low", price: cur[:low], time: Time.at(cur[:time]).utc.strftime("%H:%M %m/%d") } if cur[:low] < prev[:low] && cur[:low] < nxt[:low]
-  end
+  # Confluence: do all timeframes agree?
+  trends = levels.values.map { |l| l[:market_structure][:trend] }
+  unique_trends = trends.uniq
+  aligned = unique_trends.size == 1
+  majority_trend = trends.max_by { |t| trends.count(t) }
 
-  recent_highs = swings.select { |s| s[:type] == "swing_high" }.last(5).map { |s| s[:price] }
-  recent_lows  = swings.select { |s| s[:type] == "swing_low" }.last(5).map { |s| s[:price] }
+  # Determine entry bias
+  entry_trend = levels[tf[:entry]][:market_structure][:trend]
+  trend_trend = levels[tf[:trend]][:market_structure][:trend]
+  macro_trend = tf[:macro] ? levels[tf[:macro]][:market_structure][:trend] : nil
 
-  # Determine trend: compare recent swing pattern
-  trend = if recent_highs.size >= 2 && recent_lows.size >= 2
-    if recent_highs[-1] > recent_highs[-2] && recent_lows[-1] > recent_lows[-2]
-      "uptrend"
-    elsif recent_highs[-1] < recent_highs[-2] && recent_lows[-1] < recent_lows[-2]
-      "downtrend"
-    else
-      "ranging"
+  bias = if aligned
+    case majority_trend
+    when "uptrend"   then "Strong bullish — all TFs aligned. Look for long entries on pullbacks to OBs."
+    when "downtrend" then "Strong bearish — all TFs aligned. Look for short entries on rallies to OBs."
+    else "Ranging — wait for BOS/CHoCH before entering."
     end
   else
-    "insufficient_data"
-  end
-
-  # --- Order blocks: find the candle before a strong impulsive move ---
-  order_blocks = []
-  candles.each_cons(2) do |prev, cur|
-    body_prev = (prev[:close] - prev[:open]).abs
-    body_cur  = (cur[:close] - cur[:open]).abs
-    range_cur = (cur[:high] - cur[:low]).abs
-    if range_cur > 0 && body_cur / range_cur > 0.6 && body_cur > body_prev * 1.5
-      direction = cur[:close] > cur[:open] ? "bullish" : "bearish"
-      order_blocks << {
-        direction: direction,
-        zone: direction == "bullish" ? [prev[:low], prev[:high]] : [prev[:high], prev[:low]],
-        time: Time.at(prev[:time]).utc.strftime("%H:%M %m/%d"),
-        strength: body_cur > body_prev * 2.5 ? "strong" : "moderate"
-      }
+    if macro_trend == "uptrend" && entry_trend == "downtrend"
+      "Bullish on higher TF, bearish on entry TF — possible pullback. Wait for HTF support and entry-TF reversal."
+    elsif macro_trend == "downtrend" && entry_trend == "uptrend"
+      "Bearish on higher TF, bullish on entry TF — possible relief rally. Wait for HTF resistance and entry-TF rejection."
+    else
+      "Mixed signals — reduce position size or wait for clearer alignment."
     end
   end
-
-  # --- Fair Value Gaps (FVGs): 3-candle imbalance ---
-  fvgs = []
-  candles.each_cons(3) do |c1, c2, c3|
-    fvg_top = [c1[:high], c2[:high], c3[:high]].min
-    fvg_bot = [c1[:low], c2[:low], c3[:low]].max
-    if c2[:high] < c3[:low]
-      fvgs << { type: "bullish_fvg", zone: [c2[:high], c3[:low]], time: Time.at(c2[:time]).utc.strftime("%H:%M %m/%d") }
-    elsif c2[:low] > c1[:high]
-      fvgs << { type: "bearish_fvg", zone: [c1[:high], c2[:low]], time: Time.at(c2[:time]).utc.strftime("%H:%M %m/%d") }
-    end
-  end
-
-  # --- Key levels from order book ---
-  ob_url = "#{BINANCE_API}/api/v3/depth?symbol=#{symbol}&limit=100"
-  ob_raw = JSON.parse(Net::HTTP.get(URI(ob_url)))
-  bid_levels = ob_raw["bids"].map { |b| b[0].to_f }
-  ask_levels = ob_raw["asks"].map { |a| a[0].to_f }
-  bid_liquidity = (bid_levels.first(5).sum / 5).round(2) unless bid_levels.empty?
-  ask_liquidity = (ask_levels.first(5).sum / 5).round(2) unless ask_levels.empty?
-
-  last = candles.last
-  current_price = last[:close]
 
   # Build result
-  result = {
-    symbol: symbol,
-    interval: interval,
-    current_price: current_price,
-    timestamp: Time.now.utc.strftime("%Y-%m-%d %H:%M UTC"),
-    market_structure: {
-      trend: trend,
-      last_swing_high: recent_highs.last,
-      last_swing_low: recent_lows.last
-    },
-    key_levels: {
-      resistance: recent_highs.last(3),
-      support: recent_lows.last(3),
-      order_book_bid_wall: bid_liquidity,
-      order_book_ask_wall: ask_liquidity
-    },
-    order_blocks: order_blocks.last(5).map { |ob|
-      dir_icon = ob[:direction] == "bullish" ? "🟢" : "🔴"
-      zone_str = ob[:zone].is_a?(Array) ? "$#{ob[:zone].min} - $#{ob[:zone].max}" : "$#{ob[:zone]}"
-      "#{dir_icon} #{ob[:direction]} OB at #{zone_str} (#{ob[:strength]}, #{ob[:time]})"
-    },
-    fair_value_gaps: fvgs.last(5).map { |fg|
-      type_icon = fg[:type] == "bullish_fvg" ? "🟢" : "🔴"
-      "#{type_icon} #{fg[:type]} at $#{fg[:zone].min} - $#{fg[:zone].max} (#{fg[:time]})"
-    },
-    trade_bias: case trend
-    when "uptrend" then "Bullish — look for buy entries at order blocks or FVG fills"
-    when "downtrend" then "Bearish — look for sell entries at order blocks or FVG fills"
-    else "Neutral — wait for BOS/CHoCH confirmation"
-    end
-  }
-  result.to_s
+  tf_sections = tfs.map do |interval|
+    l = levels[interval]
+    role = case interval
+           when tf[:entry] then "ENTRY"
+           when tf[:trend] then "TREND"
+           else "MACRO"
+           end
+    ob_lines = l[:order_blocks].empty? ? "  (none)" : l[:order_blocks].map { |ob| "  #{ob}" }.join("\n")
+    fvg_lines = l[:fair_value_gaps].empty? ? "  (none)" : l[:fair_value_gaps].map { |fg| "  #{fg}" }.join("\n")
+    <<~SECTION.chomp
+      [#{role} #{interval}] #{l[:market_structure][:trend]} @ $#{l[:current_price]}
+        Swing high: $#{l[:market_structure][:last_swing_high] || "N/A"}
+        Swing low:  $#{l[:market_structure][:last_swing_low] || "N/A"}
+        OBs:
+        #{ob_lines}
+        FVGs:
+        #{fvg_lines}
+    SECTION
+  end.join("\n")
+
+  result = <<~RESULT
+    Multi-Timeframe SMC Analysis: #{symbol}
+    Style: #{style} — #{tf[:label]}
+    Time: #{Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")}
+    Current Price: $#{levels[tf[:entry]][:current_price]}
+
+    #{tf_sections}
+
+    Confluence: #{aligned ? "✅ All timeframes aligned" : "⚠️ Timeframes disagree"}
+    Bias: #{bias}
+  RESULT
+  result
 rescue => e
   "Error: #{e.message}"
 end
@@ -867,7 +975,8 @@ module Chatbot
   class Session
     SYSTEM_PROMPT = "You are an automated crypto futures trading agent with SMC expertise. " \
                     "Always fetch LIVE data — never make up prices or levels. " \
-                    "Analyze with: find_smc_levels, fetch_klines, fetch_ticker, fetch_orderbook, " \
+                    "Analyze with: analyze_multi_tf (MULTI-TIMEFRAME — primary entry tool, use trading_style: scalping/intraday/swing/positional), " \
+                    "find_smc_levels (single timeframe), fetch_klines, fetch_ticker, fetch_orderbook, " \
                     "get_funding_rate, get_open_interest. " \
                     "Manage risk with: position_sizing, risk_check. " \
                     "Check state: get_account_balance, get_positions, get_open_orders. " \
