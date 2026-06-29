@@ -116,6 +116,8 @@ module Chatbot
     def set_ollama_env(config)
       ENV["OLLAMA_BASE_URL"] = config.base_url
       ENV["OLLAMA_API_KEY"] = config.api_keys if config.api_keys&.length&.positive?
+      ENV["OLLAMA_AGENT_SKILLS"] = "0"
+      ENV["OLLAMA_AGENT_EXTERNAL_SKILLS"] = "0"
     end
   end
 end
