@@ -3,9 +3,12 @@ require "ollama_client"
 
 module Chatbot
   class REPL
+    HISTORY_FILE = File.expand_path("../../.chatbot_history", __dir__)
+
     def initialize(session:)
       @session = session
       @running = false
+      load_history
     end
 
     def run
@@ -13,17 +16,39 @@ module Chatbot
       puts "-" * 50
 
       while @running
-        input = Readline.readline("You> ", true)
+        input = Readline.readline("You> ", false)
         break if input.nil?
 
         input = input.strip
         next if input.empty?
+
+        save_to_history(input)
 
         handle_command(input) || chat(input)
       end
     end
 
     private
+
+    def load_history
+      if File.exist?(HISTORY_FILE)
+        File.readlines(HISTORY_FILE).each do |line|
+          line = line.chomp
+          next if line.empty?
+          Readline::HISTORY.push(line)
+        end
+      end
+    end
+
+    def save_to_history(input)
+      # Append to readline in-memory history if it's different from the last entry
+      if Readline::HISTORY.empty? || Readline::HISTORY.to_a.last != input
+        Readline::HISTORY.push(input)
+      end
+
+      # Persist to local history file
+      File.open(HISTORY_FILE, "a") { |f| f.puts(input) }
+    end
 
     def chat(input)
       result = @session.chat(input)

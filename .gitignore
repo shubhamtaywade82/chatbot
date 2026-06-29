@@ -2,3 +2,4 @@ chat_history.json
 .env
 tradingbot/trading_bot.db
 tradingbot/config.yml
+.chatbot_history

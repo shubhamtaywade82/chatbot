@@ -20,7 +20,6 @@ module OllamaAgent
             print "\e[36m💭 Thinking...\e[0m"
             @thinking_active = true
           end
-          print "\e[90m.\e[0m"
         end
 
         hooks.on(:on_token) do |payload|
@@ -310,7 +309,11 @@ end
 module SMC
   def self.fetch_candles(symbol, interval, limit: 150)
     url = "#{BINANCE_API}/api/v3/klines?symbol=#{symbol}&interval=#{interval}&limit=#{limit}"
-    raw = JSON.parse(Net::HTTP.get(URI(url)))
+    resp = Net::HTTP.get_response(URI(url))
+    raise "Binance API request failed (Invalid symbol or API error): #{resp.message}" unless resp.is_a?(Net::HTTPOK)
+    raw = JSON.parse(resp.body)
+    raise "Invalid candles data received" unless raw.is_a?(Array)
+
     raw.map do |k|
       {
         time: k[0] / 1000,
