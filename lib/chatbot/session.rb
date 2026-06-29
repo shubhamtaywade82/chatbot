@@ -5,6 +5,68 @@ require "json"
 require "openssl"
 require "ollama_agent"
 require_relative "smc_engines"
+require_relative "terminal_markdown"
+
+# Monkeypatch ConsoleStreamer to style markdown line-by-line
+module OllamaAgent
+  module Streaming
+    class ConsoleStreamer
+      def attach(hooks)
+        @line_buffer = +""
+        @thinking_active = false
+
+        hooks.on(:on_thinking) do |payload|
+          if !@thinking_active
+            print "\e[36m💭 Thinking...\e[0m"
+            @thinking_active = true
+          end
+          print "\e[90m.\e[0m"
+        end
+
+        hooks.on(:on_token) do |payload|
+          if @thinking_active
+            print "\r\e[K" # Clear the thinking line
+            @thinking_active = false
+          end
+
+          @line_buffer << payload[:token]
+
+          if @line_buffer.include?("\n")
+            lines = @line_buffer.split("\n", -1)
+            @line_buffer = lines.pop || ""
+            lines.each do |line|
+              puts Chatbot::TerminalMarkdown.render_line(line)
+            end
+          end
+        end
+
+        hooks.on(:on_tool_call) do |payload|
+          if @thinking_active
+            print "\r\e[K"
+            @thinking_active = false
+          end
+          warn Console.tool_call_line(payload[:name], payload[:args])
+        end
+
+        hooks.on(:on_tool_result) do |payload|
+          warn Console.tool_result_line(payload[:name], payload[:result])
+        end
+
+        hooks.on(:on_complete) do
+          if @thinking_active
+            print "\r\e[K"
+            @thinking_active = false
+          end
+          if !@line_buffer.empty?
+            puts Chatbot::TerminalMarkdown.render_line(@line_buffer)
+            @line_buffer = +""
+          end
+          puts
+        end
+      end
+    end
+  end
+end
 
 # Return only custom tools — no built-in coding tools
 module OllamaAgent
