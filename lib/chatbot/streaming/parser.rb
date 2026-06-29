@@ -6,9 +6,9 @@ module Chatbot
       attr_reader :buffer, :thinking, :answer, :in_thinking
 
       def initialize(extractor: nil)
-        @buffer = ""
-        @thinking = ""
-        @answer = ""
+        @buffer = +""
+        @thinking = +""
+        @answer = +""
         @in_thinking = false
         @extractor = extractor
       end
@@ -24,7 +24,7 @@ module Chatbot
         else
           @answer << @buffer
         end
-        @buffer = ""
+        @buffer = +""
       end
 
       private
@@ -58,13 +58,13 @@ module Chatbot
       def flush_answer
         flush = @buffer[0...-10]
         @answer << flush
-        @buffer = @buffer[-10..-1] || ""
+        @buffer = @buffer[-10..-1] || +""
       end
 
       def flush_thinking
         flush = @buffer[0...-10]
         @thinking << flush
-        @buffer = @buffer[-10..-1] || ""
+        @buffer = @buffer[-10..-1] || +""
       end
     end
   end

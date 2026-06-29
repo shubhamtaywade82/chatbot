@@ -16,7 +16,7 @@ module Chatbot
     end
 
     def log(event, payload = {})
-      @logger.send(@logger.level) { { event: event, **payload } }
+      @logger.info { { event: event, **payload } }
     end
 
     def request(model:, messages_count:, latency_ms:, tokens_in:, tokens_out:)

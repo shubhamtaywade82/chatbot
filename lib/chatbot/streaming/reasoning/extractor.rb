@@ -16,7 +16,7 @@ module Chatbot
           return nil unless (idx = buffer.index(START_TAG))
           {
             before: buffer[0...idx],
-            after: buffer[(idx + START_TAG.length)..-1] || ""
+            after: buffer[(idx + START_TAG.length)..-1] || +""
           }
         end
 
@@ -24,7 +24,7 @@ module Chatbot
           return nil unless (idx = buffer.index(END_TAG))
           {
             before: buffer[0...idx],
-            after: buffer[(idx + END_TAG.length)..-1] || ""
+            after: buffer[(idx + END_TAG.length)..-1] || +""
           }
         end
       end
@@ -36,7 +36,7 @@ module Chatbot
           return nil unless (idx = buffer.index(START_TAG))
           {
             before: buffer[0...idx],
-            after: buffer[(idx + START_TAG.length)..-1] || ""
+            after: buffer[(idx + START_TAG.length)..-1] || +""
           }
         end
 
@@ -44,7 +44,7 @@ module Chatbot
           return nil unless (idx = buffer.index(END_TAG))
           {
             before: buffer[0...idx],
-            after: buffer[(idx + END_TAG.length)..-1] || ""
+            after: buffer[(idx + END_TAG.length)..-1] || +""
           }
         end
       end
