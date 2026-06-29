@@ -1,6 +1,67 @@
 require "securerandom"
 require "ollama_agent"
 
+# Monkey-patch ChatStreamProcessor to accumulate tool_calls across chunks
+module Ollama
+  class Client
+    class ChatStreamProcessor
+      alias_method :orig_process_message_field, :process_message_field
+      def process_message_field(obj)
+        calls = obj.dig("message", "tool_calls")
+        (@acc_tool_calls ||= []).concat(calls) if calls
+        orig_process_message_field(obj)
+      end
+
+      alias_method :orig_build_result, :build_result
+      def build_result
+        result = orig_build_result
+        calls = @acc_tool_calls
+        if calls && !calls.empty?
+          result["message"] ||= {}
+          result["message"]["tool_calls"] = calls
+        end
+        result
+      end
+    end
+  end
+end
+
+# Fix ChatCoordinator to provide correct hook keys for ollama-client v1.3.0
+module OllamaAgent
+  class Agent
+    class ChatCoordinator
+      private
+
+      def ollama_stream_hooks
+        turn = -> { @current_turn }
+        {
+          on_thought: lambda { |event|
+            data = event.respond_to?(:data) ? event.data.to_s : event.to_s
+            @hooks.emit(:on_thinking, { token: data, turn: turn.call })
+          },
+          on_token: lambda { |*args|
+            token = args[0]
+            logprobs = args[1]
+            payload = { token: token, turn: turn.call }
+            payload[:logprobs] = logprobs unless logprobs.nil?
+            @hooks.emit(:on_token, payload)
+          },
+          on_tool_call: lambda { |tc|
+            @hooks.emit(:on_tool_call, {
+              name: tc.respond_to?(:name) ? tc.name : tc["name"],
+              args: tc.respond_to?(:arguments) ? tc.arguments : tc["arguments"],
+              turn: turn.call
+            })
+          },
+          on_complete: lambda {
+            @hooks.emit(:on_complete, {})
+          }
+        }
+      end
+    end
+  end
+end
+
 module Chatbot
   class Session
     SYSTEM_PROMPT = "You are a helpful, concise assistant."
