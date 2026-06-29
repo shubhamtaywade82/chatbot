@@ -1631,29 +1631,31 @@ OllamaAgent::Tools.register("subscribe_market_data", schema: {
 
   url = "wss://stream.binance.com:9443/ws/#{stream_name}"
   data_buf = []
-  error_buf = nil
   connected = false
 
   ws = WebSocket::Client::Simple.connect(url)
 
   ws.on(:open) { connected = true }
   ws.on(:message) { |msg| data_buf << msg.data }
-  ws.on(:error) { |err| error_buf = err.message }
+  ws.on(:error) { }
   ws.on(:close) { }
 
-  20.times do
-    break if connected || error_buf
-    sleep 0.1
-  end
-
-  unless connected || data_buf.any?
+  # Wait for connection (up to 2s) then collect data for requested duration
+  20.times { break if connected; sleep 0.1 }
+  unless connected
     ws.close rescue nil
-    next error_buf ? "WebSocket error: #{error_buf}" : "WebSocket connection timeout to #{url}"
+    next "WebSocket connection timeout (2s) to #{url}"
   end
 
-  sleep duration
+  # Poll for data: up to `duration` seconds, exit early if data arrives
+  deadline = Time.now + duration
+  while Time.now < deadline
+    break if data_buf.any?
+    sleep 0.05
+  end
+
   ws.close rescue nil
-  sleep 0.3
+  sleep 0.1
 
   if data_buf.any?
     parsed = data_buf.map { |d| JSON.parse(d) rescue nil }.compact
@@ -1687,6 +1689,8 @@ OllamaAgent::Tools.register("subscribe_market_data", schema: {
         asks: (last["a"] || []).first(5).map { |a| { price: a[0].to_f, qty: a[1].to_f } }
       }.to_s
     end
+  else
+    "No data received in #{duration}s on #{channel} for #{symbol}."
   end
 rescue => e
   "WebSocket error: #{e.message}"
