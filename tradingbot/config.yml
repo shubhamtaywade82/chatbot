@@ -1,0 +1,34 @@
+symbols:
+  - ETHUSDT
+  - SOLUSDT
+  - XRPUSDT
+
+monitor:
+  poll_interval_sec: 60
+  timeframes: [15m, 1h, 4h]
+  candle_limit: 200
+
+analysis:
+  model: qwen3.5:4b
+  base_url: http://localhost:11434
+  min_analysis_interval_sec: 120
+  max_setups_per_symbol: 1
+
+execution:
+  mode: paper
+  max_risk_per_trade_pct: 2.0
+  max_open_trades: 3
+  default_leverage: 3
+  min_rr_ratio: 2.0
+
+backtest:
+  start_date: "2025-06-01"
+  end_date: "2025-12-31"
+  initial_balance: 1000.0
+  maker_fee: 0.0002
+  taker_fee: 0.0004
+  slippage_pct: 0.05
+
+logging:
+  level: info
+  verbose: false
