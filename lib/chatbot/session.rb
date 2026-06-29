@@ -1,6 +1,13 @@
 require "securerandom"
 require "ollama_agent"
 
+# Disable all tools — pure chatbot, no file editing
+module OllamaAgent
+  def self.tools_for(read_only:, orchestrator:)
+    []
+  end
+end
+
 # Monkey-patch ChatStreamProcessor to accumulate tool_calls across chunks
 module Ollama
   class Client
