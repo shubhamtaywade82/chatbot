@@ -49,7 +49,6 @@ module Chatbot
     registry.register(Tools::Weather)
 
     pipeline = Middleware::Pipeline.new
-    pipeline.use(Middleware::Logging.new(logger))
     pipeline.use(Middleware::Retry.new(max_retries: config.retries))
     pipeline.use(Middleware::Metrics.new)
 

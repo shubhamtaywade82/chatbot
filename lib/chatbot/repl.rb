@@ -42,8 +42,6 @@ module Chatbot
 
       if result[:error]
         puts "\n[ERROR] #{result[:error]}"
-      elsif result[:thinking] && !result[:thinking].empty?
-        puts "\n[Reasoning: #{result[:thinking].length} chars]"
       end
     end
 
