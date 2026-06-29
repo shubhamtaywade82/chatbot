@@ -1,10 +1,12 @@
 require "securerandom"
+require "net/http"
+require "uri"
 require "ollama_agent"
 
-# Disable all tools — pure chatbot, no file editing
+# Return only custom tools — no built-in coding tools
 module OllamaAgent
   def self.tools_for(read_only:, orchestrator:)
-    []
+    Tools::Registry.custom_schemas
   end
 end
 
@@ -69,9 +71,70 @@ module OllamaAgent
   end
 end
 
+# Register chatbot tools
+OllamaAgent::Tools.register("http_get", schema: {
+  description: "Fetch any HTTP/HTTPS URL and return the response body. " \
+               "Use for API calls (crypto prices, weather, etc.), web pages, or any public URL.",
+  parameters: {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+        description: "Full URL to fetch (http:// or https:// only)"
+      }
+    },
+    required: ["url"]
+  }
+}) do |args, root:, read_only:|
+  uri = URI.parse(args["url"].to_s)
+  raise "Only http/https allowed" unless %w[http https].include?(uri.scheme)
+
+  Net::HTTP.get(uri)
+rescue => e
+  "Error: #{e.message}"
+end
+
+OllamaAgent::Tools.register("current_time", schema: {
+  description: "Get the current date and time. Use when the user asks about today's date, " \
+               "current time, day of week, or any time-related question.",
+  parameters: {
+    type: "object",
+    properties: {},
+    required: []
+  }
+}) do |args, root:, read_only:|
+  Time.now.strftime("%Y-%m-%d %H:%M:%S %Z")
+end
+
+OllamaAgent::Tools.register("calculate", schema: {
+  description: "Evaluate a mathematical expression and return the numeric result. " \
+               "Supports +, -, *, /, ** (power), and parentheses. " \
+               "Use for precise computation rather than mental arithmetic.",
+  parameters: {
+    type: "object",
+    properties: {
+      expression: {
+        type: "string",
+        description: "Arithmetic expression, e.g. '(12 + 8) / 5' or '2 ** 10'"
+      }
+    },
+    required: ["expression"]
+  }
+}) do |args, root:, read_only:|
+  expr = args["expression"].to_s
+  raise "Empty expression" if expr.empty?
+  raise "Only digits, operators, spaces, parens, and decimal points allowed" unless expr.match?(/\A[\d\s+\-*\/()%.,e]+\z/)
+
+  eval(expr).to_s
+rescue => e
+  "Error: #{e.message}"
+end
+
 module Chatbot
   class Session
-    SYSTEM_PROMPT = "You are a helpful, concise assistant."
+    SYSTEM_PROMPT = "You are a helpful, concise assistant with access to tools. " \
+                    "Use http_get to fetch live data, current_time for time queries, " \
+                    "and calculate for math."
 
     def initialize(config)
       @config = config
