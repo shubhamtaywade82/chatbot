@@ -181,6 +181,7 @@ module Chatbot
       ENV["OLLAMA_API_KEY"] = config.api_keys if config.api_keys&.length&.positive?
       ENV["OLLAMA_AGENT_SKILLS"] = "0"
       ENV["OLLAMA_AGENT_EXTERNAL_SKILLS"] = "0"
+      ENV.delete("OLLAMA_AGENT_THINK")
     end
   end
 end
