@@ -18,7 +18,7 @@ module Chatbot
       end
 
       def on_start
-        @output.print "#{COLORS[:system]}thinking...#{COLORS[:answer]}"
+        @output.print "#{COLORS[:system]}thinking... #{COLORS[:answer]}"
         @output.flush
         @started = false
       end
@@ -33,6 +33,10 @@ module Chatbot
 
       def on_reasoning(token)
         on_token(token, type: :thinking)
+      end
+
+      def on_separator
+        @output.puts "\n#{COLORS[:system]}---#{COLORS[:answer]}"
       end
 
       def on_tool(name, args)

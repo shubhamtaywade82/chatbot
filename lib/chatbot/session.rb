@@ -94,6 +94,7 @@ module Chatbot
       extractor = reasoning_extractor
       parser = Streaming::Parser.new(extractor: extractor)
       thought_buf = +""
+      content_buf = +""
 
       renderer.on_start
 
@@ -112,16 +113,23 @@ module Chatbot
           },
           on_token: ->(token) {
             return if @cancelled
+            content_buf << token
             parser.feed(token)
-            type = parser.in_thinking ? :thinking : :answer
-            renderer.on_token(token, type: type)
+            renderer.on_token(token, type: :thinking)
           },
           on_complete: -> {
             parser.flush
             renderer.on_finish
+            full = content_buf
+            answer = extract_answer(full)
+            if answer && answer != full.strip
+              renderer.on_separator
+              renderer.on_token(answer, type: :answer)
+              renderer.on_finish
+            end
             reasoning = thought_buf.empty? ? parser.thinking : thought_buf
             conversation.add(AssistantMessage.new(
-              content: parser.answer,
+              content: full,
               reasoning: reasoning
             ))
           },
@@ -132,7 +140,20 @@ module Chatbot
       )
 
       thinking = thought_buf.empty? ? parser.thinking : thought_buf
-      { thinking: thinking, answer: parser.answer }
+      { thinking: thinking, answer: content_buf }
+    end
+
+    THINK_RE = /\A\s*(?:\d+[\.\)]|[-*\u2022]|\[|\(|\*{1,2}|(?:\w[\w\s]*)?\w+[*:])/i
+
+    def extract_answer(text)
+      paragraphs = text.split(/\n\n+/)
+      return nil if paragraphs.empty?
+
+      non_thinking = paragraphs.reject { |p| p.strip.match?(THINK_RE) }
+      return paragraphs.last.strip if non_thinking.empty?
+
+      candidate = non_thinking.last.strip
+      candidate unless candidate.empty?
     end
 
     def tool_chat
