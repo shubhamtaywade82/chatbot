@@ -1,6 +1,7 @@
 require "json"
 require "net/http"
 require "openssl"
+require_relative "telegram_notifier"
 
 module TradingBot
   class Trader
@@ -161,6 +162,15 @@ module TradingBot
       )
       @storage.log_event(symbol: trade_record["symbol"], event_type: "trade_closed",
                          price: exit_price, description: "#{reason} PnL=#{pnl.round(2)}")
+
+      pnl_colored = pnl >= 0 ? "\e[32m+$#{pnl.round(2)}\e[0m" : "\e[31m-$#{pnl.abs.round(2)}\e[0m"
+      puts "  🔔 \e[1mPOSITION CLOSED:\e[0m #{trade[:direction]} #{trade_record["symbol"]} | Exit: \e[36m$#{exit_price.round(4)}\e[0m | Reason: \e[33m#{reason}\e[0m | PnL: #{pnl_colored} (\e[35m#{pnl_pct.round(2)}%\e[0m)"
+
+      close_msg = "🔔 *POSITION CLOSED: #{trade[:direction]} #{trade_record["symbol"]}*\n" \
+                  "Exit Price: $#{exit_price.round(4)}\n" \
+                  "Reason: #{reason}\n" \
+                  "PnL: #{pnl >= 0 ? '+' : ''}$#{pnl.round(2)} (#{pnl_pct.round(2)}%)"
+      TelegramNotifier.send_alert(@config, close_msg)
     end
 
     private

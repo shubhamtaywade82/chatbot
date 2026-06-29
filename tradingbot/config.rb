@@ -11,9 +11,20 @@ module TradingBot
     :log_level, :verbose,
     :binance_api_key, :binance_api_secret,
     :coindcx_api_key, :coindcx_api_secret,
+    :telegram_enabled, :telegram_bot_token, :telegram_chat_id,
     keyword_init: true
   ) do
     def self.load(path = nil)
+      dotenv_path = File.join(__dir__, "..", ".env")
+      if File.exist?(dotenv_path)
+        File.readlines(dotenv_path).each do |line|
+          next if line.strip.empty? || line.start_with?("#")
+          key, val = line.split("=", 2)
+          next unless key && val
+          ENV[key.strip] = val.strip.gsub(/\A['"]|['"]\z/, "")
+        end
+      end
+
       path ||= File.join(__dir__, "config.yml")
       raw = YAML.safe_load(File.read(path), permitted_classes: [Symbol])
       new(
@@ -41,7 +52,10 @@ module TradingBot
         binance_api_key: ENV["CHAT_BINANCE_API_KEY"],
         binance_api_secret: ENV["CHAT_BINANCE_API_SECRET"],
         coindcx_api_key: ENV["CHAT_COINDCX_API_KEY"],
-        coindcx_api_secret: ENV["CHAT_COINDCX_API_SECRET"]
+        coindcx_api_secret: ENV["CHAT_COINDCX_API_SECRET"],
+        telegram_enabled: raw.dig("telegram", "enabled") || false,
+        telegram_bot_token: raw.dig("telegram", "bot_token"),
+        telegram_chat_id: raw.dig("telegram", "chat_id")
       )
     end
 

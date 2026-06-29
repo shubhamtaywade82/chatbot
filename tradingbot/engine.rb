@@ -3,6 +3,8 @@ require_relative "storage"
 require_relative "scanner"
 require_relative "analyst"
 require_relative "trader"
+require_relative "telegram_notifier"
+require_relative "../lib/chatbot/terminal_markdown"
 require_relative "../lib/chatbot/smc_engines"
 
 module TradingBot
@@ -119,7 +121,9 @@ module TradingBot
       if result[:action] == "trade"
         handle_trade_signal(symbol, result)
       elsif @config.verbose?
-        puts "  #{symbol}: #{result[:reason]}"
+        result[:reason].to_s.each_line do |line|
+          puts "  " + Chatbot::TerminalMarkdown.render_line(line.chomp)
+        end
       end
     end
 
@@ -169,7 +173,16 @@ module TradingBot
 
     def handle_trade_signal(symbol, signal)
       signal[:symbol] = symbol
-      puts "  TRADE SIGNAL: #{signal[:direction]} #{symbol} @ $#{signal[:entry_price]} R=#{signal[:rr_ratio]}"
+      puts "  \e[33m⚡ TRADE SIGNAL:\e[0m \e[1m#{signal[:direction]} #{symbol}\e[0m @ \e[36m$#{signal[:entry_price]}\e[0m R=\e[32m#{signal[:rr_ratio]}\e[0m"
+
+      # Send Telegram alert for signal
+      alert_msg = "⚡ *TRADE SIGNAL: #{signal[:direction]} #{symbol}*\n" \
+                  "Entry: $#{signal[:entry_price]}\n" \
+                  "Stop Loss: $#{signal[:stop_loss]}\n" \
+                  "Take Profit 1: $#{signal[:take_profit_1]}\n" \
+                  "Risk/Reward: #{signal[:rr_ratio]}\n" \
+                  "Reason: #{signal[:reason]}"
+      TelegramNotifier.send_alert(@config, alert_msg)
 
       @storage.log_signal(
         symbol: symbol, direction: signal[:direction], confidence: signal[:confidence],
@@ -182,12 +195,21 @@ module TradingBot
 
       result = @trader.execute(signal)
       if result[:success]
-        puts "  ✅ #{result[:type].upcase} #{signal[:direction]} #{symbol} | Entry: $#{result[:entry]} | Qty: #{result[:qty]}"
+        puts "  ✅ \e[32m#{result[:type].upcase} #{signal[:direction]} #{symbol}\e[0m | Entry: \e[36m$#{result[:entry]}\e[0m | Qty: \e[35m#{result[:qty]}\e[0m"
         @storage.log_event(symbol: symbol, event_type: "trade_executed",
                            price: signal[:entry_price],
                            description: "Executed #{signal[:direction]} #{symbol} @ $#{signal[:entry_price]}")
+        # Send Telegram execution success alert
+        exec_msg = "✅ *EXECUTION SUCCESS: #{result[:type].upcase} #{signal[:direction]} #{symbol}*\n" \
+                   "Price: $#{result[:entry]}\n" \
+                   "Quantity: #{result[:qty]}"
+        TelegramNotifier.send_alert(@config, exec_msg)
       else
-        puts "  ❌ Trade rejected: #{result[:reason]}"
+        puts "  ❌ \e[31mTrade rejected: #{result[:reason]}\e[0m"
+        # Send Telegram execution rejection alert
+        rej_msg = "❌ *TRADE REJECTED: #{signal[:direction]} #{symbol}*\n" \
+                  "Reason: #{result[:reason]}"
+        TelegramNotifier.send_alert(@config, rej_msg)
       end
     end
 
@@ -212,21 +234,29 @@ module TradingBot
     def log_status(symbol, now, state, open_trades)
       last_event = state[:last_event_time]
       time_since = last_event ? "#{((now - last_event) / 60).round(1)}m ago" : "never"
-      print "#{Time.now.strftime("%H:%M:%S")} #{symbol} open=#{open_trades} events=#{time_since}"
+      print "\e[36m#{Time.now.strftime("%H:%M:%S")}\e[0m \e[1m#{symbol}\e[0m open=\e[33m#{open_trades}\e[0m events=\e[35m#{time_since}\e[0m"
     end
 
     def log_events(symbol, events)
       if events.any?
         types = events.map { |e| e[:type] }.tally
-        puts "  EVENTS: #{types.map { |k, v| "#{k}x#{v}" }.join(", ")}"
+        puts "  \e[33mEVENTS:\e[0m #{types.map { |k, v| "\e[32m#{k}\e[0mx\e[1m#{v}\e[0m" }.join(", ")}"
       else
-        puts "  no events"
+        puts "  \e[90mno events\e[0m"
       end
     end
 
     def print_summary
       summary = @storage.summary
-      puts "--- Bot Summary: #{summary[:total_trades]} trades, #{summary[:open_trades]} open, PnL: $#{summary[:total_pnl]}"
+      pnl = summary[:total_pnl] || 0.0
+      pnl_colored = if pnl > 0
+                      "\e[32m$#{pnl.round(2)}\e[0m"
+                    elsif pnl < 0
+                      "\e[31m$#{pnl.round(2)}\e[0m"
+                    else
+                      "$#{pnl.round(2)}"
+                    end
+      puts "\e[90m───\e[0m \e[1mBot Summary:\e[0m #{summary[:total_trades]} trades, #{summary[:open_trades]} open | PnL: #{pnl_colored}"
     end
 
     def fetch_candles(symbol, interval, limit: 150)
