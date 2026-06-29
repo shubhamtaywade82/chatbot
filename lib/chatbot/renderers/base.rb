@@ -3,6 +3,7 @@
 module Chatbot
   module Renderers
     class Base
+      def on_start; end
       def on_token(token, type: :answer); end
       def on_reasoning(token); end
       def on_tool(name, args); end

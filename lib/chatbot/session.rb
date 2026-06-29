@@ -93,6 +93,9 @@ module Chatbot
     def stream_chat(think:)
       extractor = reasoning_extractor
       parser = Streaming::Parser.new(extractor: extractor)
+      thought_buf = +""
+
+      renderer.on_start
 
       client.chat(
         messages: conversation.to_api,
@@ -100,6 +103,13 @@ module Chatbot
         think: think,
         options: { num_predict: config.max_response_tokens },
         hooks: {
+          on_thought: ->(event) {
+            case event.type
+            when :thought_delta
+              thought_buf << event.data
+              renderer.on_token(event.data, type: :thinking)
+            end
+          },
           on_token: ->(token) {
             return if @cancelled
             parser.feed(token)
@@ -109,9 +119,10 @@ module Chatbot
           on_complete: -> {
             parser.flush
             renderer.on_finish
+            reasoning = thought_buf.empty? ? parser.thinking : thought_buf
             conversation.add(AssistantMessage.new(
               content: parser.answer,
-              reasoning: parser.thinking
+              reasoning: reasoning
             ))
           },
           on_error: ->(err) {
@@ -120,7 +131,8 @@ module Chatbot
         }
       )
 
-      { thinking: parser.thinking, answer: parser.answer }
+      thinking = thought_buf.empty? ? parser.thinking : thought_buf
+      { thinking: thinking, answer: parser.answer }
     end
 
     def tool_chat

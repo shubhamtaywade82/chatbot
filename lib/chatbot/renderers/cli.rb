@@ -17,7 +17,17 @@ module Chatbot
         @output = output
       end
 
+      def on_start
+        @output.print "#{COLORS[:system]}thinking...#{COLORS[:answer]}"
+        @output.flush
+        @started = false
+      end
+
       def on_token(token, type: :answer)
+        unless @started
+          @output.print "\r\e[K"
+          @started = true
+        end
         @output.print "#{COLORS[type]}#{token}#{COLORS[:answer]}"
       end
 

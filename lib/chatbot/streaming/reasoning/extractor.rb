@@ -9,8 +9,8 @@ module Chatbot
       end
 
       class Qwen < Extractor
-        START_TAG = ''
-        END_TAG = ''
+        START_TAG = '<think>'
+        END_TAG = '</think>'
 
         def extract_start(buffer)
           return nil unless (idx = buffer.index(START_TAG))
@@ -30,7 +30,8 @@ module Chatbot
       end
 
       class DeepSeek < Extractor
-        START_TAG = ''
+        START_TAG = '<think>'
+        END_TAG = '</think>'
 
         def extract_start(buffer)
           return nil unless (idx = buffer.index(START_TAG))
