@@ -12,7 +12,8 @@ module Chatbot
       end
 
       def call(request)
-        chain = @middlewares.reverse.reduce(yield) do |next_mw, mw|
+        inner = ->(req) { yield(req) }
+        chain = @middlewares.reverse.reduce(inner) do |next_mw, mw|
           ->(req) { mw.call(req, next_mw) }
         end
         chain.call(request)
