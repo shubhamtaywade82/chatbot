@@ -65,25 +65,34 @@ To add the same tool as a built-in in ollama_agent:
 
 ## Current Tools
 
-### Market Data (public — no auth)
+### Market Data & SMC Analysis (public — no auth)
 
 | Tool | What it does | When the model calls it |
 |------|-------------|------------------------|
-| `http_get` | Fetches any URL | Need live data from any public API |
+| `http_get` | Fetches any URL | Live data from any public API |
 | `current_time` | Returns current datetime | Time, date, day-of-week queries |
 | `calculate` | Evaluates math expressions | Arithmetic, percentages, conversions |
-| `fetch_klines` | OHLCV candlesticks from Binance Spot | Chart patterns, trend analysis, indicator calc |
-| `fetch_ticker` | 24h stats from Binance Spot | Current price snapshot, momentum check |
-| `fetch_orderbook` | Order book depth from Binance Spot | Liquidity levels, support/resistance walls |
-| `find_smc_levels` | SMC analysis on one timeframe (Spot klines) | Single-TF check, quick trend read |
-| `analyze_multi_tf` | **Multi-timeframe SMC** with trading style support | **Primary entry tool** — replaces multiple find_smc_levels calls |
+| `fetch_klines` | OHLCV candlesticks | Low-level chart data |
+| `fetch_ticker` | 24h stats from Binance Spot | Quick price snapshot |
+| `fetch_orderbook` | Order book depth | Liquidity levels |
+| `find_smc_levels` | SMC on one TF (BOS/CHoCH, OBs, sweeps, PD) | Quick single-TF check |
+| `analyze_multi_tf` | Multi-TF SMC with style support (BOS/CHoCH, OBs, sweeps, PD) | **PRIMARY analysis tool** |
+
+### SMC Deep-Dive Tools (public — no auth)
+
+| Tool | What it does | When the model calls it |
+|------|-------------|------------------------|
+| `analyze_market_structure` | BOS/CHoCH, HH/LH/HL/LL, protected levels | After analyze_multi_tf for structural context |
+| `find_liquidity_sweeps` | Equal highs/lows, sweep events with reclaim | Entry timing, stop-hunt detection |
+| `find_order_blocks` | Displacement-confirmed OBs, mitigation state | Entry level precision |
+| `identify_trade_setup` | **FLAGSHIP**: full pipeline → entry/SL/TP1-3/R:R | Trade decisions — combines all engines |
 
 ### Futures Analysis (public — no auth)
 
 | Tool | What it does | When the model calls it |
 |------|-------------|------------------------|
-| `get_funding_rate` | Current + historical funding rates | Assess sentiment, cost of holding |
-| `get_open_interest` | Open interest (current + 24h trend) | Confirm trend strength, detect reversals |
+| `get_funding_rate` | Current + historical funding rates | Sentiment, cost of holding |
+| `get_open_interest` | Open interest (current + 24h trend) | Trend confirmation, reversals |
 
 ### Account & Position Management (requires API key)
 
@@ -127,28 +136,37 @@ Each style analyzes 2-3 timeframes and reports:
 ## Tool Patterns
 
 **Raw data tools** (`fetch_klines`, `fetch_ticker`, `fetch_orderbook`, `get_funding_rate`, `get_open_interest`):
-- Fetch from Binance API (public endpoints, no auth needed for Futures analysis tools)
+- Fetch from Binance API (public endpoints)
 - Parse JSON, extract relevant fields
 - Return formatted string
 
-**Compound analysis tools** (`find_smc_levels`, `analyze_multi_tf`):
-- Fetch raw data internally (klines + optionally order book)
-- Apply algorithmic analysis (swing points, order blocks, FVGs)
-- Return structured analysis with current price, trend, levels, and trade bias
-- `analyze_multi_tf` runs SMC across 2-3 timeframes and computes confluence
-- One tool call = complete multi-TF analysis (reduces model turn count)
+**Engine-based compound tools** (`find_smc_levels`, `analyze_multi_tf`):
+- Use `smc_engines.rb` modules (PivotDetector, MarketStructure, Displacement, OrderBlock, LiquiditySweep, PDArray)
+- BOS/CHoCH detection, swing classification (HH/LH/HL/LL), protected levels
+- ATR-based displacement confirmation for institutional impulse detection
+- Order blocks with creation-at-BOS, mitigation, and invalidation lifecycle
+- Equal highs/lows + sweep detection with reclaim confirmation
+- Premium/discount zone evaluation
+
+**Deep-dive SMC tools** (`analyze_market_structure`, `find_liquidity_sweeps`, `find_order_blocks`):
+- Each exposes one engine layer for the model to inspect
+- Called after `analyze_multi_tf` when the model needs precision timing/levels
+
+**Flagship tool** (`identify_trade_setup`):
+- Calls ALL engines internally across 2-3 timeframes (depending on trading style)
+- Implements PB-7 Sweep+OB and PB-3 BOS Pullback trade setups (ported from smc-backtester)
+- Returns concrete entry price, stop loss, TP1/TP2/TP3, and R:R ratio
+- Uses EntryConfirmation module for candle pattern detection (engulfing, rejection wicks)
 
 **State tools** (`get_account_balance`, `get_positions`, `get_open_orders`):
 - Call Binance Futures signed endpoints (HMAC SHA256)
-- Used by the model to understand current portfolio state
 - Never modify state
 
 **Execution tools** (`place_order`, `cancel_order`, `set_leverage`):
 - Modify state on Binance Futures
-- `place_order` system prompt instructs the model to **always** present trade details and ask for user confirmation before executing
+- `place_order` always requires risk_check first and user confirmation
 
 **Risk tools** (`position_sizing`, `risk_check`):
-- Pure computation layered on account state
 - Enforce position limits (max 2% risk per trade warning)
 - Must be called before `place_order`
 
@@ -180,17 +198,43 @@ API key requirements (Binance Futures):
 
 ```
 User: "Swing trade SOLUSDT"
-  → analyze_multi_tf(symbol=SOLUSDT, trading_style=swing)
-  → get_funding_rate (sentiment check)
-  → get_open_interest (trend confirmation)
-  → position_sizing (calculate quantity)
-  → risk_check (validate the trade)
-  → Present to user: "Here's the setup. Confirm?"
+  → analyze_multi_tf(SOLUSDT, swing)               # Multi-TF context
+  → identify_trade_setup(SOLUSDT, swing)            # Concrete entry/SL/TP
+ 
+  If setup found:
+    → get_funding_rate(SOLUSDT)                      # Sentiment check
+    → get_open_interest(SOLUSDT)                     # Trend confirmation
+    → position_sizing(SOLUSDT, entry, SL, 1%, 3x)    # Quantity
+    → risk_check(SOLUSDT, BUY, entry, qty, SL, 3x)   # Validate
+    → Present to user: "Entry $X, SL $Y, TP1 $Z (1R), TP2 $Z (2R), TP3 $Z (3R). Confirm?"
+    
+  If NO setup:
+    → analyze_market_structure(SOLUSDT, 1h)          # BOS/CHoCH deep dive
+    → find_liquidity_sweeps(SOLUSDT, 15m)            # Sweep timing
+    → find_order_blocks(SOLUSDT, 1h)                 # OB precision
+    → Present levels to watch + what needs to happen for setup activation
   
 User: "confirm"
   → set_leverage
   → place_order
   → get_positions (verify fill)
+```
+
+## SMC Engines Architecture
+
+All engines are in `lib/chatbot/smc_engines.rb`, ported from the smc-backtester project:
+
+```
+Candles (Binance API)
+  → PivotDetector (swing highs/lows with left/right bars)
+  → MarketStructure (BOS/CHoCH, HH/LH/HL/LL, protected levels)  
+  → ATR (Wilder smoothing, period 14)
+  → Displacement (body 1.5x ATR, range 2x ATR, min body 60%)
+  → OrderBlock (creation at BOS, mitigation, invalidation)
+  → LiquiditySweep (equal highs/lows 0.1% tolerance, sweep+reclaim)
+  → EntryConfirmation (bullish/bearish engulfing, rejection wicks)
+  → PDArray (equilibrium, discount/premium zones)
+  → TradeSetups (PB-7 Sweep+OB, PB-3 BOS Pullback)
 ```
 
 ## Model Compatibility

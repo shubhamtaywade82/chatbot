@@ -4,6 +4,7 @@ require "uri"
 require "json"
 require "openssl"
 require "ollama_agent"
+require_relative "smc_engines"
 
 # Return only custom tools — no built-in coding tools
 module OllamaAgent
@@ -242,10 +243,9 @@ rescue => e
 end
 
 # ---------------------------------------------------------------------------
-# SMC analysis engine — reusable across single-TF and multi-TF tools
+# SMC module — uses engines from smc_engines.rb, shared by all analysis tools
 # ---------------------------------------------------------------------------
 module SMC
-  # Fetch klines from Binance Spot and parse into candle hashes
   def self.fetch_candles(symbol, interval, limit: 150)
     url = "#{BINANCE_API}/api/v3/klines?symbol=#{symbol}&interval=#{interval}&limit=#{limit}"
     raw = JSON.parse(Net::HTTP.get(URI(url)))
@@ -258,87 +258,54 @@ module SMC
     end
   end
 
-  # Analyze candles and return structured SMC hash
-  def self.analyze(candles, symbol, interval)
-    # Market structure: find swing highs/lows
-    swings = []
-    candles.each_cons(3) do |prev, cur, nxt|
-      swings << { type: "swing_high", price: cur[:high] } if cur[:high] > prev[:high] && cur[:high] > nxt[:high]
-      swings << { type: "swing_low",  price: cur[:low] }  if cur[:low]  < prev[:low]  && cur[:low]  < nxt[:low]
-    end
+  # Full SMC analysis using all engines
+  def self.analyze(candles, symbol, interval, find_sweeps: false)
+    pivots = PivotDetector.detect(candles, left_bars: 4, right_bars: 4)
+    ms = MarketStructure.analyze(candles, pivots[:highs], pivots[:lows])
+    atr = ATR.compute(candles)
+    displacements = Displacement.detect(candles, atr)
+    obs = OrderBlock.detect(candles, ms[:bos_events], displacements)
 
-    recent_highs = swings.select { |s| s[:type] == "swing_high" }.last(5).map { |s| s[:price] }
-    recent_lows  = swings.select { |s| s[:type] == "swing_low"  }.last(5).map { |s| s[:price] }
+    eq = LiquiditySweep.find_equal_highs_lows(pivots[:highs], pivots[:lows])
+    sweeps = find_sweeps ? LiquiditySweep.detect_sweeps(candles, pivots[:highs], pivots[:lows], equal_highs: eq[:equal_highs], equal_lows: eq[:equal_lows]) : []
 
-    trend = if recent_highs.size >= 2 && recent_lows.size >= 2
-      if recent_highs[-1] > recent_highs[-2] && recent_lows[-1] > recent_lows[-2]
-        "uptrend"
-      elsif recent_highs[-1] < recent_highs[-2] && recent_lows[-1] < recent_lows[-2]
-        "downtrend"
-      else
-        "ranging"
-      end
-    else
-      "insufficient_data"
-    end
+    recent = candles.last(50)
+    range_high = recent.map { |c| c[:high] }.max || candles.last[:high]
+    range_low  = recent.map { |c| c[:low] }.min  || candles.last[:low]
+    pd = PDArray.compute(range_high, range_low)
 
-    # Order blocks: candle before a strong impulsive move
-    order_blocks = []
-    candles.each_cons(2) do |prev, cur|
-      body_prev = (prev[:close] - prev[:open]).abs
-      body_cur  = (cur[:close] - cur[:open]).abs
-      range_cur = (cur[:high] - cur[:low]).abs
-      if range_cur > 0 && body_cur / range_cur > 0.6 && body_cur > body_prev * 1.5
-        direction = cur[:close] > cur[:open] ? "bullish" : "bearish"
-        order_blocks << {
-          direction: direction,
-          zone: direction == "bullish" ? [prev[:low], prev[:high]] : [prev[:high], prev[:low]],
-          strength: body_cur > body_prev * 2.5 ? "strong" : "moderate"
-        }
-      end
-    end
-
-    # Fair Value Gaps: 3-candle imbalance
-    fvgs = []
-    candles.each_cons(3) do |c1, c2, c3|
-      if c2[:high] < c3[:low]
-        fvgs << { type: "bullish_fvg", zone: [c2[:high], c3[:low]] }
-      elsif c2[:low] > c1[:high]
-        fvgs << { type: "bearish_fvg", zone: [c1[:high], c2[:low]] }
-      end
-    end
-
-    last = candles.last
-    current_price = last[:close]
+    last_c = candles.last
+    in_discount = PDArray.discount?(last_c[:close], pd)
 
     {
-      symbol: symbol,
-      interval: interval,
-      current_price: current_price,
-      candles_count: candles.size,
-      market_structure: {
-        trend: trend,
-        last_swing_high: recent_highs.last,
-        last_swing_low: recent_lows.last
+      symbol: symbol, interval: interval,
+      current_price: last_c[:close],
+      candles: candles.size,
+      atr: atr.round(4),
+      timestamp: Time.now.utc.strftime("%Y-%m-%d %H:%M UTC"),
+      trend: ms[:trend],
+      bos_events: ms[:bos_events].last(5).map { |e| "BOS #{e[:type]} @ $#{e[:price]} (candle #{e[:index]})" },
+      choch_events: ms[:choch_events].last(3).map { |e| "CHoCH #{e[:choch_type]} @ $#{e[:price]}" },
+      protected_high: ms[:protected_high],
+      protected_low: ms[:protected_low],
+      last_swing_high_value: ms[:last_swing_high],
+      last_swing_low_value: ms[:last_swing_low],
+      displacement_count: displacements.size,
+      order_blocks: obs.select { |ob| !ob[:invalidated] }.last(4).map { |ob|
+        dir = ob[:direction] == :bullish ? "🟢 Bullish" : "🔴 Bearish"
+        state = ob[:mitigated] ? "mitigated" : "active"
+        "#{dir} OB $#{ob[:zone].min} - $#{ob[:zone].max} (#{state})"
       },
-      key_levels: {
-        resistance: recent_highs.last(3),
-        support: recent_lows.last(3)
-      },
-      order_blocks: order_blocks.last(5).map { |ob|
-        dir_icon = ob[:direction] == "bullish" ? "🟢" : "🔴"
-        zone_str = "$#{ob[:zone].min} - $#{ob[:zone].max}"
-        "#{dir_icon} #{ob[:direction]} OB #{zone_str} (#{ob[:strength]})"
-      },
-      fair_value_gaps: fvgs.last(5).map { |fg|
-        type_icon = fg[:type] == "bullish_fvg" ? "🟢" : "🔴"
-        "#{type_icon} #{fg[:type]} $#{fg[:zone].min} - $#{fg[:zone].max}"
-      },
-      trade_bias: case trend
-      when "uptrend" then "Bullish"
-      when "downtrend" then "Bearish"
-      else "Neutral"
-      end
+      equal_highs: eq[:equal_highs].last(3).map { |e| "$#{e[:price]}" },
+      equal_lows: eq[:equal_lows].last(3).map { |e| "$#{e[:price]}" },
+      sweeps: sweeps.last(3).map { |s| "#{s[:type]} of $#{s[:swept_level]} at candle #{s[:sweep_index]}" },
+      discount_zone: in_discount,
+      pd_range: { low: pd[:low].round(2), high: pd[:high].round(2), equilibrium: pd[:equilibrium] },
+      trade_bias: case ms[:trend]
+                  when :bullish then "Bullish"
+                  when :bearish then "Bearish"
+                  else "Neutral"
+                  end
     }
   end
 end
@@ -347,9 +314,8 @@ end
 # SMC single-timeframe tool
 # ---------------------------------------------------------------------------
 OllamaAgent::Tools.register("find_smc_levels", schema: {
-  description: "Perform Smart Money Concepts (SMC) analysis on one timeframe. " \
-               "Returns trend, swing-highs/lows, order blocks, and fair value gaps. " \
-               "For a complete picture across multiple timeframes use analyze_multi_tf.",
+  description: "Full SMC analysis on one timeframe using institutional-grade engines (BOS/CHoCH, displacement, order blocks, sweeps, PD array). " \
+               "Returns trend, protected levels, order blocks with mitigation state, displacement count, sweeps, and premium/discount zone.",
   parameters: {
     type: "object",
     properties: {
@@ -360,6 +326,10 @@ OllamaAgent::Tools.register("find_smc_levels", schema: {
       interval: {
         type: "string",
         description: "Candle interval: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w (default: 1h)"
+      },
+      find_sweeps: {
+        type: "boolean",
+        description: "Whether to also detect liquidity sweeps (default: false for speed)"
       }
     },
     required: ["symbol"]
@@ -367,9 +337,9 @@ OllamaAgent::Tools.register("find_smc_levels", schema: {
 }) do |args, **|
   symbol = args["symbol"].to_s.upcase.strip
   interval = args["interval"] || "1h"
+  sweeps = args["find_sweeps"] == true
   candles = SMC.fetch_candles(symbol, interval)
-  result = SMC.analyze(candles, symbol, interval)
-  result[:timestamp] = Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")
+  result = SMC.analyze(candles, symbol, interval, find_sweeps: sweeps)
   result.to_s
 rescue => e
   "Error: #{e.message}"
@@ -387,11 +357,9 @@ TRADING_STYLES = {
 
 OllamaAgent::Tools.register("analyze_multi_tf", schema: {
   description: "Multi-timeframe SMC analysis with trading style support. " \
-               "Automatically selects the right timeframes for your style: " \
-               "scalping (1m/5m), intraday (15m/1h), swing (1h/4h/1d), positional (4h/1d/1w). " \
-               "For each timeframe returns trend, order blocks, and FVGs. " \
-               "Provides confluence assessment and specific trade setup recommendations. " \
-               "Use this as the primary entry analysis tool — it replaces multiple find_smc_levels calls.",
+               "Auto-selects timeframes per style: scalping (1m/5m), intraday (15m/1h), swing (1h/4h/1d), positional (4h/1d/1w). " \
+               "Returns per-TF trend with BOS/CHoCH events, order blocks, displacement, sweeps, PD zones. " \
+               "Includes confluence assessment. THE BEST TOOL for initial market analysis.",
   parameters: {
     type: "object",
     properties: {
@@ -413,44 +381,37 @@ OllamaAgent::Tools.register("analyze_multi_tf", schema: {
   tf = TRADING_STYLES[style]
   next "Unknown style: #{style}. Choose: scalping, intraday, swing, positional" unless tf
 
-  # Fetch + analyze each timeframe
   levels = {}
   tfs = [tf[:entry], tf[:trend]]
   tfs << tf[:macro] if tf[:macro]
 
   tfs.each do |interval|
-    candles = SMC.fetch_candles(symbol, interval, limit: 100)
-    levels[interval] = SMC.analyze(candles, symbol, interval)
+    candles = SMC.fetch_candles(symbol, interval, limit: 120)
+    levels[interval] = SMC.analyze(candles, symbol, interval, find_sweeps: true)
   end
 
-  # Confluence: do all timeframes agree?
-  trends = levels.values.map { |l| l[:market_structure][:trend] }
-  unique_trends = trends.uniq
-  aligned = unique_trends.size == 1
-  majority_trend = trends.max_by { |t| trends.count(t) }
-
-  # Determine entry bias
-  entry_trend = levels[tf[:entry]][:market_structure][:trend]
-  trend_trend = levels[tf[:trend]][:market_structure][:trend]
-  macro_trend = tf[:macro] ? levels[tf[:macro]][:market_structure][:trend] : nil
+  trends = levels.values.map { |l| l[:trend] }
+  aligned = trends.uniq.size == 1
+  entry_t = levels[tf[:entry]]
+  trend_t = levels[tf[:trend]]
+  macro_t = tf[:macro] ? levels[tf[:macro]] : nil
 
   bias = if aligned
-    case majority_trend
-    when "uptrend"   then "Strong bullish — all TFs aligned. Look for long entries on pullbacks to OBs."
-    when "downtrend" then "Strong bearish — all TFs aligned. Look for short entries on rallies to OBs."
+    case entry_t[:trend]
+    when :bullish then "Strong bullish — all TFs aligned. Long entries on OB retests in discount zone."
+    when :bearish then "Strong bearish — all TFs aligned. Short entries on OB retests in premium zone."
     else "Ranging — wait for BOS/CHoCH before entering."
     end
   else
-    if macro_trend == "uptrend" && entry_trend == "downtrend"
-      "Bullish on higher TF, bearish on entry TF — possible pullback. Wait for HTF support and entry-TF reversal."
-    elsif macro_trend == "downtrend" && entry_trend == "uptrend"
-      "Bearish on higher TF, bullish on entry TF — possible relief rally. Wait for HTF resistance and entry-TF rejection."
+    if macro_t && macro_t[:trend] == :bullish && entry_t[:trend] == :bearish
+      "Bullish HTF, bearish LTF — possible pullback. Fade LTF bearish when price hits HTF discount / OB."
+    elsif macro_t && macro_t[:trend] == :bearish && entry_t[:trend] == :bullish
+      "Bearish HTF, bullish LTF — possible relief rally. Fade LTF bullish when price hits HTF premium / OB."
     else
       "Mixed signals — reduce position size or wait for clearer alignment."
     end
   end
 
-  # Build result
   tf_sections = tfs.map do |interval|
     l = levels[interval]
     role = case interval
@@ -458,31 +419,510 @@ OllamaAgent::Tools.register("analyze_multi_tf", schema: {
            when tf[:trend] then "TREND"
            else "MACRO"
            end
-    ob_lines = l[:order_blocks].empty? ? "  (none)" : l[:order_blocks].map { |ob| "  #{ob}" }.join("\n")
-    fvg_lines = l[:fair_value_gaps].empty? ? "  (none)" : l[:fair_value_gaps].map { |fg| "  #{fg}" }.join("\n")
+    ob_str = l[:order_blocks].empty? ? "  (none)" : l[:order_blocks].map { |ob| "  #{ob}" }.join("\n")
     <<~SECTION.chomp
-      [#{role} #{interval}] #{l[:market_structure][:trend]} @ $#{l[:current_price]}
-        Swing high: $#{l[:market_structure][:last_swing_high] || "N/A"}
-        Swing low:  $#{l[:market_structure][:last_swing_low] || "N/A"}
+      [#{role} #{interval}] #{l[:trend]} @ $#{l[:current_price]}
+        ATR: #{l[:atr]}  Displacements: #{l[:displacement_count]}
+        Prot Low: $#{l[:protected_low] || "N/A"}  Prot High: $#{l[:protected_high] || "N/A"}
         OBs:
-        #{ob_lines}
-        FVGs:
-        #{fvg_lines}
+        #{ob_str}
+        Sweeps:
+          #{l[:sweeps].empty? ? "  (none)" : l[:sweeps].map { |s| "  #{s}" }.join("\n")}
+        PD: #{l[:discount_zone] ? "DISCOUNT" : "PREMIUM"}  Equilibrium: $#{l[:pd_range][:equilibrium]}
     SECTION
   end.join("\n")
 
-  result = <<~RESULT
-    Multi-Timeframe SMC Analysis: #{symbol}
-    Style: #{style} — #{tf[:label]}
-    Time: #{Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")}
-    Current Price: $#{levels[tf[:entry]][:current_price]}
+  entry_choch = entry_t[:choch_events]
+  entry_bos = entry_t[:bos_events]
+  choch_str = entry_choch.empty? ? "" : "\nCHoCH signals: #{entry_choch.join(", ")}"
+  bos_str = entry_bos.empty? ? "" : "\nBOS signals: #{entry_bos.first(3).join(", ")}"
+
+  <<~RESULT
+    Multi-TF SMC: #{symbol}
+    Style: #{style}
+    Price: $#{entry_t[:current_price]}  Vol: #{entry_t[:candles]} candles
+    #{choch_str}#{bos_str}
 
     #{tf_sections}
 
-    Confluence: #{aligned ? "✅ All timeframes aligned" : "⚠️ Timeframes disagree"}
+    Confluence: #{aligned ? "✅ All TFs aligned" : "⚠️ TFs disagree"}
     Bias: #{bias}
+    Action: #{aligned && entry_t[:trend] != :ranging ? "Ready for #{entry_t[:trend]} setups. Use identify_trade_setup for entry/SL/TP." : "Wait for structure to develop. Use identify_trade_setup to check."}
   RESULT
-  result
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
+# Market Structure deep-dive tool
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("analyze_market_structure", schema: {
+  description: "Deep market structure analysis: BOS/CHoCH events, HH/LH/HL/LL swing classification, protected levels, and trend strength. " \
+               "Use when you need to understand the structural state of the market — is it trending or ranging? Are there reversal signals? " \
+               "Calls after analyze_multi_tf for deeper context on a specific timeframe.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      interval: {
+        type: "string",
+        description: "Candle interval to analyze (default: 1h)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  interval = args["interval"] || "1h"
+  candles = SMC.fetch_candles(symbol, interval, limit: 150)
+  pivots = PivotDetector.detect(candles, left_bars: 4, right_bars: 4)
+  ms = MarketStructure.analyze(candles, pivots[:highs], pivots[:lows])
+  atr = ATR.compute(candles)
+
+  swing_report = ms[:swing_highs].last(10).map { |s| "#{s[:type]} @ $#{s[:price]}" }.join(", ")
+  swing_report_l = ms[:swing_lows].last(10).map { |s| "#{s[:type]} @ $#{s[:price]}" }.join(", ")
+
+  <<~RESULT
+    Market Structure: #{symbol} #{interval}
+    Trend: #{ms[:trend]}
+    ATR: #{atr.round(4)}
+    Protected High: $#{ms[:protected_high] || "N/A"}
+    Protected Low: $#{ms[:protected_low] || "N/A"}
+    Last Swing High: $#{ms[:last_swing_high] || "N/A"}
+    Last Swing Low: $#{ms[:last_swing_low] || "N/A"}
+
+    Recent BOS events:
+    #{ms[:bos_events].empty? ? "  (none)" : ms[:bos_events].last(5).map { |e| "  #{e[:type]} @ $#{e[:price]} (candle #{e[:index]})" }.join("\n")}
+
+    Recent CHoCH events:
+    #{ms[:choch_events].empty? ? "  (none)" : ms[:choch_events].last(3).map { |e| "  #{e[:choch_type]} @ $#{e[:price]}" }.join("\n")}
+
+    Recent Swing Highs (type/price): #{swing_report}
+    Recent Swing Lows (type/price): #{swing_report_l}
+  RESULT
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
+# Liquidity sweep detector
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("find_liquidity_sweeps", schema: {
+  description: "Detect liquidity sweeps (stop hunts) — equal highs/lows and sweep events with reclaim confirmation. " \
+               "Sell-side sweep (SSL) = low breaks below swing low, close reclaims. Buy-side sweep (BSL) = high breaks above swing high, close reclaims. " \
+               "Sweeps often precede reversals. Use after analyze_multi_tf for entry timing.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      interval: {
+        type: "string",
+        description: "Candle interval (default: 15m for entry timing)"
+      },
+      tolerance_pct: {
+        type: "number",
+        description: "Tolerance for equal highs/lows detection as decimal (default: 0.001 = 0.1%%)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  interval = args["interval"] || "15m"
+  tol = (args["tolerance_pct"] || 0.001).to_f
+  candles = SMC.fetch_candles(symbol, interval, limit: 200)
+  pivots = PivotDetector.detect(candles, left_bars: 4, right_bars: 4)
+  eq = LiquiditySweep.find_equal_highs_lows(pivots[:highs], pivots[:lows], tolerance_pct: tol)
+  sweeps = LiquiditySweep.detect_sweeps(candles, pivots[:highs], pivots[:lows], equal_highs: eq[:equal_highs], equal_lows: eq[:equal_lows])
+
+  eqh = eq[:equal_highs].last(5).map { |e| "$#{e[:price]} (indices #{e[:indices].join(", ")})" }
+  eql = eq[:equal_lows].last(5).map { |e| "$#{e[:price]} (indices #{e[:indices].join(", ")})" }
+
+  sweep_lines = sweeps.last(8).map { |s| "  #{s[:type]} sweeping $#{s[:swept_level]} at candle #{s[:sweep_index]}, reclaimed at $#{s[:close].round(2)}" }
+
+  <<~RESULT
+    Liquidity Sweeps: #{symbol} #{interval}
+    Current Price: $#{candles.last[:close]}
+
+    Equal Highs (BSL targets):
+    #{eqh.empty? ? "  (none)" : eqh.map { |e| "  #{e}" }.join("\n")}
+
+    Equal Lows (SSL targets):
+    #{eql.empty? ? "  (none)" : eql.map { |e| "  #{e}" }.join("\n")}
+
+    Recent Sweep Events:
+    #{sweep_lines.empty? ? "  (none)" : sweep_lines.join("\n")}
+
+    Total: #{eqh.size + eql.size} levels, #{sweeps.size} sweeps detected
+  RESULT
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
+# Order block detector with displacement confirmation
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("find_order_blocks", schema: {
+  description: "Find institutional order blocks confirmed by displacement (ATR-based impulse). " \
+               "Each OB shows: direction, zone, mitigation state, and invalidation status. " \
+               "Mitigated OBs = already used by institutions. Invalidated OBs = failed levels. Active OBs = potential entry zones. " \
+               "Use after analyze_market_structure for entry level precision.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      interval: {
+        type: "string",
+        description: "Candle interval (default: 1h)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  interval = args["interval"] || "1h"
+  candles = SMC.fetch_candles(symbol, interval, limit: 200)
+  pivots = PivotDetector.detect(candles, left_bars: 4, right_bars: 4)
+  ms = MarketStructure.analyze(candles, pivots[:highs], pivots[:lows])
+  atr = ATR.compute(candles)
+  displacements = Displacement.detect(candles, atr)
+  obs = OrderBlock.detect(candles, ms[:bos_events], displacements)
+
+  price = candles.last[:close]
+  retesting = obs.select { |ob| !ob[:invalidated] && OrderBlock.retesting?(price, ob) }
+
+  ob_lines = obs.map.with_index do |ob, i|
+    dir = ob[:direction] == :bullish ? "🟢 Bullish" : "🔴 Bearish"
+    status = if ob[:invalidated] then "INVALIDATED"
+             elsif ob[:mitigated] then "MITIGATED"
+             else "ACTIVE"
+             end
+    retest = OrderBlock.retesting?(price, ob) ? " ⬅️ PRICE HERE" : ""
+    "  #{dir} OB $#{ob[:zone].min} - $#{ob[:zone].max} [#{status}]#{retest}"
+  end
+
+  disp_lines = displacements.last(5).map { |d| "  #{d[:direction]} displacement @ $#{d[:price]} method=#{d[:method]}" }
+
+  <<~RESULT
+    Order Blocks: #{symbol} #{interval}
+    ATR: #{atr.round(4)}  Displacements: #{displacements.size}
+
+    Displacements (last 5):
+    #{disp_lines.empty? ? "  (none)" : disp_lines.join("\n")}
+
+    All OBs (#{obs.size}):
+    #{ob_lines.empty? ? "  (none)" : ob_lines.join("\n")}
+
+    Price Currently Retesting: #{retesting.empty? ? "None" : "$#{price}"}
+  RESULT
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
+# FLAGSHIP: identify_trade_setup — full pipeline, concrete entry/SL/TP
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("identify_trade_setup", schema: {
+  description: "🚀 FLAGSHIP TOOL: Complete trade setup identification. " \
+               "Runs the full SMC pipeline (market structure, BOS/CHoCH, displacement, sweeps, OBs, PD array, candle confirmation) " \
+               "and identifies concrete trade setups: PB-7 Sweep+OB and PB-3 BOS Pullback. " \
+               "Returns actionable entry price, stop loss, 3 take-profit levels, R:R ratio, confidence assessment, and risk warnings. " \
+               "Call this when the user asks for a trade setup, entry, or signal. The ONE tool for trade decisions.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. 'SOLUSDT'"
+      },
+      trading_style: {
+        type: "string",
+        enum: ["scalping", "intraday", "swing", "positional"],
+        description: "Your trading style. Determines which timeframes are analyzed. (default: swing)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  style = (args["trading_style"] || "swing").to_s.downcase.strip
+  tf = TRADING_STYLES[style]
+  next "Unknown style: #{style}. Choose: scalping, intraday, swing, positional" unless tf
+
+  # Fetch candles for entry and trend TFs
+  entry_candles = SMC.fetch_candles(symbol, tf[:entry], limit: 200)
+  trend_candles = SMC.fetch_candles(symbol, tf[:trend], limit: 200)
+  macro_candles = tf[:macro] ? SMC.fetch_candles(symbol, tf[:macro], limit: 100) : nil
+
+  # Full analysis on entry TF
+  entry_pivots = PivotDetector.detect(entry_candles, left_bars: 4, right_bars: 4)
+  entry_ms = MarketStructure.analyze(entry_candles, entry_pivots[:highs], entry_pivots[:lows])
+  entry_atr = ATR.compute(entry_candles)
+  entry_disp = Displacement.detect(entry_candles, entry_atr)
+  entry_obs = OrderBlock.detect(entry_candles, entry_ms[:bos_events], entry_disp)
+  entry_eq = LiquiditySweep.find_equal_highs_lows(entry_pivots[:highs], entry_pivots[:lows])
+  entry_ssl = LiquiditySweep.detect_sweeps(entry_candles, entry_pivots[:highs], entry_pivots[:lows])
+
+  # Trend TF analysis for context
+  trend_pivots = PivotDetector.detect(trend_candles, left_bars: 5, right_bars: 5)
+  trend_ms = MarketStructure.analyze(trend_candles, trend_pivots[:highs], trend_pivots[:lows])
+
+  # Macro analysis
+  macro_ms = if macro_candles
+    mp = PivotDetector.detect(macro_candles, left_bars: 5, right_bars: 5)
+    MarketStructure.analyze(macro_candles, mp[:highs], mp[:lows])
+  end
+
+  price = entry_candles.last[:close]
+  recent = entry_candles.last(50)
+  pd = PDArray.compute(recent.map { |c| c[:high] }.max, recent.map { |c| c[:low] }.min)
+  in_discount = PDArray.discount?(price, pd)
+
+  # === Detect PB-7 Sweep+OB ===
+  pb7 = nil
+  recent_ssl = entry_ssl.reverse.find { |s| s[:type] == :ssl_sweep && entry_candles.size - s[:sweep_index] <= 30 }
+  recent_bsl = entry_ssl.reverse.find { |s| s[:type] == :bsl_sweep && entry_candles.size - s[:sweep_index] <= 30 }
+
+  if entry_ms[:trend] == :bullish && recent_ssl
+    # Find CHoCH and BOS after the sweep
+    sweep_idx = recent_ssl[:sweep_index]
+    after_choch = entry_ms[:choch_events].select { |c| c[:index] > sweep_idx && c[:choch_type] == :bullish_choch }
+    after_bos = entry_ms[:bos_events].select { |b| b[:index] > sweep_idx && b[:type] == :bullish_bos }
+    after_bos_from_choch = after_bos.select { |b| after_choch.empty? || b[:index] > (after_choch.first[:index] rescue 0) }
+
+    if after_choch.any? && after_bos_from_choch.any?
+      active_obs = entry_obs.select { |ob| ob[:direction] == :bullish && !ob[:invalidated] }
+      retesting = active_obs.select { |ob| OrderBlock.retesting?(price, ob) }
+      entry_ob = retesting.first || active_obs.first
+
+      if entry_ob
+        sl_price = [entry_ob[:zone].min, recent_ssl[:swept_level]].min
+        sl = (sl_price - (entry_ob[:zone][1] - entry_ob[:zone][0]) * 0.1).round(2)
+        entry_price = [price, entry_ob[:zone].max].min.round(2)
+        risk = (entry_price - sl).abs
+        tp1 = (entry_price + risk * 1).round(2)
+        tp2 = (entry_price + risk * 2).round(2)
+        tp3 = (entry_price + risk * 3).round(2)
+        rr = (risk > 0 ? ((tp3 - entry_price) / risk).round(2) : 0)
+
+        confirmed = EntryConfirmation.long_confirmed?(entry_candles, entry_candles.size - 1) ||
+                    EntryConfirmation.long_confirmed?(entry_candles, entry_candles.size - 2)
+
+        pb7 = {
+          setup: "PB-7 Sweep+OB (LONG)",
+          entry: entry_price, sl: sl,
+          tp1: tp1, tp2: tp2, tp3: tp3,
+          rr: rr,
+          confidence: confirmed ? "HIGH" : "MEDIUM",
+          confirmed_candle: confirmed,
+          ob_zone: "$#{entry_ob[:zone].min} - $#{entry_ob[:zone].max}",
+          ob_mitigated: entry_ob[:mitigated],
+          ob_mitigation_note: entry_ob[:mitigated] ? "OB already touched — reduced edge" : "OB untouched — fresh level",
+          sweep_price: recent_ssl[:swept_level],
+          discount_entry: in_discount,
+          reason: "SSL sweep → CHoCH → BOS → OB retest in discount zone"
+        }
+      end
+    end
+  end
+
+  if entry_ms[:trend] == :bearish && recent_bsl && pb7.nil?
+    after_choch = entry_ms[:choch_events].select { |c| c[:index] > recent_bsl[:sweep_index] && c[:choch_type] == :bearish_choch }
+    after_bos = entry_ms[:bos_events].select { |b| b[:index] > recent_bsl[:sweep_index] && b[:type] == :bearish_bos }
+    after_bos_from_choch = after_bos.select { |b| after_choch.empty? || b[:index] > (after_choch.first[:index] rescue 0) }
+
+    if after_choch.any? && after_bos_from_choch.any?
+      active_obs = entry_obs.select { |ob| ob[:direction] == :bearish && !ob[:invalidated] }
+      retesting = active_obs.select { |ob| OrderBlock.retesting?(price, ob) }
+      entry_ob = retesting.first || active_obs.first
+
+      if entry_ob
+        sl_price = [entry_ob[:zone].max, recent_bsl[:swept_level]].max
+        sl = (sl_price + (entry_ob[:zone][1] - entry_ob[:zone][0]) * 0.1).round(2)
+        entry_price = [price, entry_ob[:zone].min].max.round(2)
+        risk = (sl - entry_price).abs
+        tp1 = (entry_price - risk * 1).round(2)
+        tp2 = (entry_price - risk * 2).round(2)
+        tp3 = (entry_price - risk * 3).round(2)
+        rr = (risk > 0 ? ((entry_price - tp3) / risk).round(2) : 0)
+
+        confirmed = EntryConfirmation.short_confirmed?(entry_candles, entry_candles.size - 1) ||
+                    EntryConfirmation.short_confirmed?(entry_candles, entry_candles.size - 2)
+
+        pb7 = {
+          setup: "PB-7 Sweep+OB (SHORT)",
+          entry: entry_price, sl: sl,
+          tp1: tp1, tp2: tp2, tp3: tp3,
+          rr: rr,
+          confidence: confirmed ? "HIGH" : "MEDIUM",
+          confirmed_candle: confirmed,
+          ob_zone: "$#{entry_ob[:zone].min} - $#{entry_ob[:zone].max}",
+          ob_mitigated: entry_ob[:mitigated],
+          sweep_price: recent_bsl[:swept_level],
+          discount_entry: !in_discount,
+          reason: "BSL sweep → CHoCH → BOS → OB retest in premium zone"
+        }
+      end
+    end
+  end
+
+  # === Detect PB-3 BOS Pullback ===
+  pb3 = nil
+  if entry_ms[:trend] == :bullish
+    recent_bos = entry_ms[:bos_events].reverse.find { |b| b[:type] == :bullish_bos && entry_candles.size - b[:index] <= 40 }
+    if recent_bos
+      # Find HL after BOS
+      hls_after = entry_ms[:swing_lows].select { |s| s[:type] == :HL && s[:index] > recent_bos[:index] }
+      last_hl = hls_after.last
+      if last_hl && price <= last_hl[:price] * 1.005
+        sl = (last_hl[:price] * 0.999).round(2)
+        risk = (price - sl).abs
+        entry_price = price.round(2)
+        tp1 = (entry_price + risk * 1).round(2)
+        tp2 = (entry_price + risk * 2).round(2)
+        tp3 = (entry_price + risk * 3).round(2)
+        rr = (risk > 0 ? ((tp3 - entry_price) / risk).round(2) : 0)
+
+        confirmed = EntryConfirmation.long_confirmed?(entry_candles, entry_candles.size - 1)
+
+        pb3 = {
+          setup: "PB-3 BOS Pullback (LONG)",
+          entry: entry_price, sl: sl,
+          tp1: tp1, tp2: tp2, tp3: tp3,
+          rr: rr,
+          confidence: confirmed ? "HIGH" : "MEDIUM",
+          confirmed_candle: confirmed,
+          hl_price: last_hl[:price],
+          bos_price: recent_bos[:price],
+          discount_entry: in_discount,
+          reason: "Bullish BOS → HL formed → price pulled back to HL level"
+        }
+      end
+    end
+  elsif entry_ms[:trend] == :bearish
+    recent_bos = entry_ms[:bos_events].reverse.find { |b| b[:type] == :bearish_bos && entry_candles.size - b[:index] <= 40 }
+    if recent_bos
+      lhs_after = entry_ms[:swing_highs].select { |s| s[:type] == :LH && s[:index] > recent_bos[:index] }
+      last_lh = lhs_after.last
+      if last_lh && price >= last_lh[:price] * 0.995
+        sl = (last_lh[:price] * 1.001).round(2)
+        risk = (sl - price).abs
+        entry_price = price.round(2)
+        tp1 = (entry_price - risk * 1).round(2)
+        tp2 = (entry_price - risk * 2).round(2)
+        tp3 = (entry_price - risk * 3).round(2)
+        rr = (risk > 0 ? ((entry_price - tp3) / risk).round(2) : 0)
+
+        confirmed = EntryConfirmation.short_confirmed?(entry_candles, entry_candles.size - 1)
+
+        pb3 = {
+          setup: "PB-3 BOS Pullback (SHORT)",
+          entry: entry_price, sl: sl,
+          tp1: tp1, tp2: tp2, tp3: tp3,
+          rr: rr,
+          confidence: confirmed ? "HIGH" : "MEDIUM",
+          confirmed_candle: confirmed,
+          lh_price: last_lh[:price],
+          bos_price: recent_bos[:price],
+          discount_entry: !in_discount,
+          reason: "Bearish BOS → LH formed → price pulled back to LH level"
+        }
+      end
+    end
+  end
+
+  # Build output
+  trend_align = [entry_ms[:trend], trend_ms[:trend], macro_ms&.dig(:trend)].compact
+  aligned = trend_align.uniq.size == 1
+
+  output = <<~HEADER
+    ===== Trade Setup Report: #{symbol} (#{style}) =====
+    Time: #{Time.now.utc.strftime("%Y-%m-%d %H:%M UTC")}
+    Current Price: $#{price}
+
+    === Market Context ===
+    Entry TF (#{tf[:entry]}): #{entry_ms[:trend]}
+    Trend TF (#{tf[:trend]}): #{trend_ms[:trend]}
+    #{macro_ms ? "Macro TF (#{tf[:macro]}): #{macro_ms[:trend]}" : ""}
+    Alignment: #{aligned ? "✅" : "⚠️"}
+    Displacements: #{entry_disp.size}
+    Active OBs: #{entry_obs.reject { |ob| ob[:invalidated] }.size}
+    Sweeps detected: #{entry_ssl.size}
+    Price in #{in_discount ? "DISCOUNT" : "PREMIUM"} zone
+  HEADER
+
+  if pb7
+    mit_note = pb7[:ob_mitigated] ? " (already touched — partial edge)" : " (fresh — full edge)"
+    conf_star = pb7[:confidence] == "HIGH" ? "⭐ " : ""
+    output += <<~PB7
+
+      #{conf_star}=== ACTIVE SETUP: #{pb7[:setup]} ===
+      Confidence: #{pb7[:confidence]} | Risk/Reward: #{pb7[:rr]}:1
+
+      Entry: $#{pb7[:entry]}
+      Stop Loss: $#{pb7[:sl]}
+      TP1 (1R): $#{pb7[:tp1]}
+      TP2 (2R): $#{pb7[:tp2]}
+      TP3 (3R): $#{pb7[:tp3]}
+
+      OB Zone: #{pb7[:ob_zone]}#{mit_note}
+      Swept Level: $#{pb7[:sweep_price]}
+      Reason: #{pb7[:reason]}
+      Discount Entry: #{pb7[:discount_entry]}
+
+      Risk: $#{((pb7[:entry] - pb7[:sl]).abs * 100).round(2)} per 100 units
+    PB7
+  end
+
+  if pb3
+    conf_star = pb3[:confidence] == "HIGH" ? "⭐ " : ""
+    output += <<~PB3
+
+      #{conf_star}=== ACTIVE SETUP: #{pb3[:setup]} ===
+      Confidence: #{pb3[:confidence]} | Risk/Reward: #{pb3[:rr]}:1
+
+      Entry: $#{pb3[:entry]}
+      Stop Loss: $#{pb3[:sl]}
+      TP1 (1R): $#{pb3[:tp1]}
+      TP2 (2R): $#{pb3[:tp2]}
+      TP3 (3R): $#{pb3[:tp3]}
+
+      Swing Level: #{pb3[:hl_price] || pb3[:lh_price]}
+      BOS Level: $#{pb3[:bos_price]}
+      Reason: #{pb3[:reason]}
+      Discount Entry: #{pb3[:discount_entry]}
+    PB3
+  end
+
+  if pb7.nil? && pb3.nil?
+    directions = []
+    directions << "LONG" if in_discount && entry_ms[:trend] == :bullish
+    directions << "SHORT" if !in_discount && entry_ms[:trend] == :bearish
+
+    output += <<~NONE
+
+      No active trade setup detected.
+
+      What to watch:
+      #{"- Price in discount zone with bullish trend — watch for sweep + CHoCH to trigger PB-7" if entry_ms[:trend] == :bullish}
+      #{"- Price in premium zone with bearish trend — watch for sweep + CHoCH to trigger PB-7" if entry_ms[:trend] == :bearish}
+      #{"- Trend is ranging — wait for BOS/CHoCH before considering entries" if entry_ms[:trend] == :ranging}
+      - Key levels: last swing high $#{entry_ms[:last_swing_high] || "N/A"}, last swing low $#{entry_ms[:last_swing_low] || "N/A"}
+      - ATR: #{entry_atr.round(4)} — average candle range
+      - Consider: analyze_market_structure, find_liquidity_sweeps, find_order_blocks for deeper view
+    NONE
+  end
+
+  output
 rescue => e
   "Error: #{e.message}"
 end
@@ -969,19 +1409,333 @@ OllamaAgent::Tools.register("risk_check", schema: {
 end
 
 # ---------------------------------------------------------------------------
+# CoinDCX API — HMAC SHA256 signed requests for trade execution
+# ---------------------------------------------------------------------------
+COINDX_API = "https://api.coindcx.com"
+
+module CoinDCX
+  def self.signed_post(path, body_data)
+    key = ENV["CHAT_COINDCX_API_KEY"].to_s.strip
+    secret = ENV["CHAT_COINDCX_API_SECRET"].to_s.strip
+    return { error: "CoinDCX API key not configured. Set CHAT_COINDCX_API_KEY and CHAT_COINDCX_API_SECRET." }.to_s if key.empty? || secret.empty?
+
+    json_body = JSON.generate(body_data)
+    signature = OpenSSL::HMAC.hexdigest("SHA256", secret, json_body)
+    uri = URI("#{COINDX_API}#{path}")
+
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.open_timeout = 10
+    http.read_timeout = 10
+
+    req = Net::HTTP::Post.new(uri)
+    req["X-AUTH-APIKEY"] = key
+    req["X-AUTH-SIGNATURE"] = signature
+    req["Content-Type"] = "application/json"
+    req.body = json_body
+
+    JSON.parse(http.request(req).body)
+  rescue => e
+    { error: e.message }
+  end
+
+  def self.public_get(path, params = {})
+    uri = URI("#{COINDX_API}#{path}")
+    uri.query = URI.encode_www_form(params) unless params.empty?
+    JSON.parse(Net::HTTP.get(uri))
+  rescue => e
+    { error: e.message }
+  end
+end
+
+# ---------------------------------------------------------------------------
+# CoinDCX account tools
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("coindcx_get_balance", schema: {
+  description: "Get CoinDCX account balance for all assets. Returns available balance, locked amount, and total per coin. " \
+               "Use to check funds available for trading on CoinDCX. Alternative to get_account_balance (which is Binance).",
+  parameters: { type: "object", properties: {}, required: [] }
+}) do |args, **|
+  data = CoinDCX.signed_post("/trade/v1/users/balances", { timestamp: (Time.now.to_f * 1000).to_i })
+  next data.to_s if data.is_a?(Hash) && data[:error]
+
+  coins = (data.is_a?(Array) ? data : []).select { |c| c["balance"].to_f > 0 || c["locked_balance"].to_f > 0 }
+  next "No balances found." if coins.empty?
+
+  coins.map do |c|
+    { coin: c["currency"], available: c["balance"].to_f, locked: c["locked_balance"].to_f,
+      total: c["balance"].to_f + c["locked_balance"].to_f }
+  end.to_s
+end
+
+OllamaAgent::Tools.register("coindcx_get_open_orders", schema: {
+  description: "Get open orders on CoinDCX. Shows order ID, market, side, type, price, quantity, and status. " \
+               "Use to review pending orders before placing new ones or to find order IDs for cancellation.",
+  parameters: {
+    type: "object",
+    properties: {
+      market: {
+        type: "string",
+        description: "Trading pair, e.g. 'SOLUSDT' or 'BTCUSDT'. Optional — omit for all markets."
+      }
+    },
+    required: []
+  }
+}) do |args, **|
+  body = { timestamp: (Time.now.to_f * 1000).to_i }
+  market = args["market"].to_s.strip.upcase
+  body[:market] = market unless market.empty?
+  data = CoinDCX.signed_post("/trade/v1/orders/active_orders", body)
+  orders = data.is_a?(Array) ? data : (data.is_a?(Hash) && data[:error] ? [data] : [])
+  orders.empty? ? "No open orders." : orders.map { |o|
+    { id: o["id"], market: o["market"], side: o["side"], type: o["order_type"],
+      price: o["price"], qty: o["quantity"], status: o["status"] }
+  }.to_s
+end
+
+OllamaAgent::Tools.register("coindcx_place_order", schema: {
+  description: "Place an order on CoinDCX. Supports market and limit orders. " \
+               "⚠️ ONLY call when user explicitly confirms. Always present details and ask for confirmation first. " \
+               "For market orders, price is not needed. For limit orders, price is required.",
+  parameters: {
+    type: "object",
+    properties: {
+      market: {
+        type: "string",
+        description: "Trading pair, e.g. 'SOLUSDT'"
+      },
+      side: {
+        type: "string", enum: ["buy", "sell"],
+        description: "buy or sell"
+      },
+      order_type: {
+        type: "string", enum: ["market", "limit"],
+        description: "market for immediate fill, limit for specific price"
+      },
+      quantity: {
+        type: "number",
+        description: "Quantity in base asset units (e.g. 0.5 SOL)"
+      },
+      price: {
+        type: "number",
+        description: "Limit price (required for limit orders)"
+      }
+    },
+    required: ["market", "side", "order_type", "quantity"]
+  }
+}) do |args, **|
+  body = {
+    timestamp: (Time.now.to_f * 1000).to_i,
+    market: args["market"].to_s.upcase.strip,
+    side: args["side"].to_s.downcase.strip,
+    order_type: args["order_type"].to_s.downcase.strip,
+    quantity: args["quantity"].to_s
+  }
+  body[:price] = args["price"].to_s if args["price"]
+  data = CoinDCX.signed_post("/trade/v1/orders/create", body)
+  data.to_s
+end
+
+OllamaAgent::Tools.register("coindcx_cancel_order", schema: {
+  description: "Cancel an open order on CoinDCX by order ID. Use coindcx_get_open_orders to find the ID.",
+  parameters: {
+    type: "object",
+    properties: {
+      id: {
+        type: "string",
+        description: "Order ID to cancel (from coindcx_get_open_orders)"
+      },
+      market: {
+        type: "string",
+        description: "Trading pair, e.g. 'SOLUSDT'"
+      }
+    },
+    required: ["id", "market"]
+  }
+}) do |args, **|
+  data = CoinDCX.signed_post("/trade/v1/orders/cancel", {
+    timestamp: (Time.now.to_f * 1000).to_i,
+    id: args["id"].to_s,
+    market: args["market"].to_s.upcase.strip
+  })
+  data.to_s
+end
+
+OllamaAgent::Tools.register("coindcx_get_positions", schema: {
+  description: "Get current positions on CoinDCX. Returns entry price, current price, PnL, and quantity for each position. " \
+               "Use to check current exposure before opening new trades.",
+  parameters: {
+    type: "object",
+    properties: {
+      market: {
+        type: "string",
+        description: "Trading pair, e.g. 'SOLUSDT'. Optional — omit for all positions."
+      }
+    },
+    required: []
+  }
+}) do |args, **|
+  body = { timestamp: (Time.now.to_f * 1000).to_i }
+  data = CoinDCX.signed_post("/trade/v1/orders/position", body)
+  positions = data.is_a?(Array) ? data : (data.is_a?(Hash) && data[:error] ? [] : [data])
+  if args["market"].to_s.strip != ""
+    m = args["market"].to_s.upcase.strip
+    positions = positions.select { |p| p["market"] == m || p["symbol"] == m }
+  end
+  positions.empty? ? "No open positions." : positions.map { |p|
+    { market: p["market"] || p["symbol"], side: p["side"],
+      entry: p["entry_price"] || p["buy_price"], current: p["current_price"] || p["last_price"],
+      qty: p["quantity"], pnl: p["pnl"] || p["unrealized_pnl"] }
+  }.to_s
+end
+
+# ---------------------------------------------------------------------------
+# WebSocket market data — Binance real-time streams
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("subscribe_market_data", schema: {
+  description: "Get REAL-TIME market data via WebSocket. Connects to Binance for N seconds and returns live klines, trades, or depth. " \
+               "Use for entry timing when you need the latest tick-level data. Longer duration = more data but slower response.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair, e.g. 'SOLUSDT'"
+      },
+      channel: {
+        type: "string",
+        enum: ["trade", "kline_1m", "kline_5m", "depth20"],
+        description: "Data stream: trade (live trades), kline_1m/5m (candles), depth20 (top 20 bids/asks). (default: trade)"
+      },
+      duration_sec: {
+        type: "integer",
+        description: "How many seconds to collect data for (1-30, default: 5). 5 seconds typically gives 5-20 trade prints."
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  require "websocket-client-simple"
+
+  symbol = args["symbol"].to_s.downcase.strip.gsub("usdt", "usdt")
+  channel = args["channel"] || "trade"
+  duration = [args["duration_sec"]&.to_i || 5, 30].min
+
+  stream_name = case channel
+                when "trade" then "#{symbol}@trade"
+                when "kline_1m" then "#{symbol}@kline_1m"
+                when "kline_5m" then "#{symbol}@kline_5m"
+                when "depth20" then "#{symbol}@depth20"
+                else "#{symbol}@trade"
+                end
+
+  url = "wss://stream.binance.com:9443/ws/#{stream_name}"
+  data_buf = []
+  error_buf = nil
+  done = false
+
+  ws = WebSocket::Client::Simple.connect(url)
+
+  ws.on(:message) do |msg|
+    data_buf << msg.data
+  end
+
+  ws.on(:error) do |err|
+    error_buf = err.message
+    done = true
+  end
+
+  ws.on(:close) do
+    done = true
+  end
+
+  # Collect data for the specified duration
+  sleep duration
+  ws.close
+  done = true
+
+  if error_buf
+    "WebSocket error: #{error_buf}"
+  elsif data_buf.empty?
+    "No data received in #{duration}s. Check symbol '#{symbol}' and try again."
+  else
+    parsed = data_buf.map { |d| JSON.parse(d) rescue nil }.compact
+    count = parsed.size
+
+    case channel
+    when "trade"
+      prices = parsed.map { |t| t["p"].to_f }.compact
+      vol = parsed.map { |t| t["q"].to_f }.compact
+      { channel: "trade", count: count, symbol: symbol,
+        last_price: prices.last, avg_price: (prices.sum / prices.size).round(4),
+        high: prices.max, low: prices.min,
+        total_volume: vol.sum.round(4),
+        sample: parsed.last(3).map { |t| { price: t["p"], qty: t["q"], time: Time.at(t["T"].to_i / 1000).utc.strftime("%H:%M:%S") } }
+      }.to_s
+    when /^kline/
+      last = parsed.last
+      k = last["k"] rescue nil
+      if k
+        { channel: channel, symbol: symbol,
+          open: k["o"], high: k["h"], low: k["l"], close: k["c"], volume: k["v"],
+          closed: k["x"], time: Time.at(k["t"].to_i / 1000).utc.strftime("%H:%M:%S")
+        }.to_s
+      else
+        "No kline data received"
+      end
+    when "depth20"
+      last = parsed.last
+      { channel: "depth20", symbol: symbol,
+        bids: (last["b"] || []).first(5).map { |b| { price: b[0].to_f, qty: b[1].to_f } },
+        asks: (last["a"] || []).first(5).map { |a| { price: a[0].to_f, qty: a[1].to_f } }
+      }.to_s
+    end
+  end
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
 # Session — orchestrates config + runner + env
 # ---------------------------------------------------------------------------
 module Chatbot
   class Session
-    SYSTEM_PROMPT = "You are an automated crypto futures trading agent with SMC expertise. " \
+    SYSTEM_PROMPT = "You are an automated crypto futures trading agent with institutional SMC expertise. " \
                     "Always fetch LIVE data — never make up prices or levels. " \
-                    "Analyze with: analyze_multi_tf (MULTI-TIMEFRAME — primary entry tool, use trading_style: scalping/intraday/swing/positional), " \
-                    "find_smc_levels (single timeframe), fetch_klines, fetch_ticker, fetch_orderbook, " \
-                    "get_funding_rate, get_open_interest. " \
-                    "Manage risk with: position_sizing, risk_check. " \
-                    "Check state: get_account_balance, get_positions, get_open_orders. " \
-                    "Execute only after user confirms: set_leverage, place_order, cancel_order. " \
-                    "Never place an order without risk_check first and user confirmation."
+                    "You have 22 tools organized into layers. USE THEM AUTONOMOUSLY in this order:\n" \
+                    "\n" \
+                    "1. MARKET ANALYSIS (always start here):\n" \
+                    "   - analyze_multi_tf(symbol, trading_style) — PRIMARY: multi-timeframe trend, BOS/CHoCH, OBs, sweeps, PD\n" \
+                    "   - find_smc_levels(symbol, interval) — single-TF deep dive\n" \
+                    "   - get_funding_rate(symbol) — market sentiment\n" \
+                    "   - get_open_interest(symbol) — trend confirmation\n" \
+                    "\n" \
+                    "2. DEEP DIVE (call these after analyze_multi_tf for precision):\n" \
+                    "   - analyze_market_structure(symbol, interval) — BOS/CHoCH, HH/LH/HL/LL, protected levels\n" \
+                    "   - find_liquidity_sweeps(symbol, interval) — stop hunts, equal highs/lows\n" \
+                    "   - find_order_blocks(symbol, interval) — displacement-confirmed OBs, mitigation state\n" \
+                    "\n" \
+                    "3. TRADE SETUP (flagship tool — combines all engines):\n" \
+                    "   - identify_trade_setup(symbol, trading_style) — returns concrete entry/SL/TP1/TP2/TP3 with R:R\n" \
+                    "\n" \
+                    "4. RISK MANAGEMENT:\n" \
+                    "   - position_sizing(symbol, entry_price, stop_loss, risk_percent, leverage) — optimal quantity\n" \
+                    "   - risk_check(symbol, side, entry_price, quantity, stop_loss, leverage) — full risk assessment\n" \
+                    "\n" \
+                    "5. ACCOUNT STATE:\n" \
+                    "   - get_account_balance — available margin\n" \
+                    "   - get_positions(symbol) — open positions\n" \
+                    "   - get_open_orders(symbol) — pending orders\n" \
+                    "\n" \
+                    "6. EXECUTION (only after user confirms):\n" \
+                    "   - set_leverage(symbol, leverage)\n" \
+                    "   - place_order — MARKET/LIMIT/STOP\n" \
+                    "   - cancel_order — by orderId\n" \
+                    "\n" \
+                    "RULES:\n" \
+                    " - When user asks about ANY crypto topic, run analyze_multi_tf + identify_trade_setup automatically.\n" \
+                    " - Present the setup to the user with entry, SL, TP levels and R:R. Ask for confirmation.\n" \
+                    " - Never place an order without risk_check first and explicit user confirmation."
 
     def initialize(config)
       @config = config
