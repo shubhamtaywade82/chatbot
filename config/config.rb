@@ -9,7 +9,7 @@ module Chatbot
                   :enable_streaming, :store_adapter
 
     def initialize
-      @base_url = ENV.fetch("OLLAMA_BASE_URL", "http://localhost:11434")
+      @base_url = ENV.fetch("CHAT_BASE_URL", "http://localhost:11434")
       @model = ENV.fetch("OLLAMA_MODEL", "qwen3.5:4b")
       @api_keys = ENV["OLLAMA_API_KEYS"]
       @enable_multi_key_concurrency = ENV["ENABLE_MULTI_KEY_CONCURRENCY"] == "true"

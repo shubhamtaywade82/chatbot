@@ -1,11 +1,8 @@
-# frozen_string_literal: true
-
 require "readline"
+require "ollama_client"
 
 module Chatbot
   class REPL
-    COMMANDS = %w[/quit /q /clear /history /models /switch /json /tools /embed /help].freeze
-
     def initialize(session:)
       @session = session
       @running = false
@@ -13,7 +10,7 @@ module Chatbot
 
     def run
       @running = true
-      banner
+      puts "-" * 50
 
       while @running
         input = Readline.readline("You> ", true)
@@ -28,21 +25,13 @@ module Chatbot
 
     private
 
-    def banner
-      puts "🤖 Ollama ChatBot — #{@session.config.model}"
-      puts "Commands: /help, /quit, /clear, /history, /switch <model>, /json <prompt>, /tools <prompt>, /embed <text>"
-      puts "-" * 50
-    end
-
     def chat(input)
-      @session.reset_cancel!
-      @session.renderer.prompt("Bot>")
-
-      result = @session.chat(input, think: true)
-
-      if result[:error]
-        puts "\n[ERROR] #{result[:error]}"
+      result = @session.chat(input)
+      if result.is_a?(Hash) && result[:error]
+        puts "  [ERROR] #{result[:error]}"
       end
+
+      nil
     end
 
     def handle_command(input)
@@ -50,58 +39,33 @@ module Chatbot
       when "/quit", "/q"
         @running = false
         puts "Goodbye!"
-        true
 
       when "/clear"
-        @session.conversation.clear!
-        puts "History cleared."
-        true
+        puts @session.reset!
 
-      when "/history"
-        @session.conversation.messages.each do |m|
-          puts "#{m.role}: #{m.content.to_s[0..200]}"
-        end
-        true
+      when "/switch", "/model"
+        puts "Usage: /switch <model_name> or /model <model_name>"
+
+      when /^\/switch (.+)/, /^\/model (.+)/
+        @session.switch_model($1.strip)
+        puts "Switched to #{$1.strip}"
 
       when "/models"
-        models = @session.client.list_model_names rescue []
-        puts models.join(", ")
-        true
-
-      when /^\/switch (.+)/
-        @session.switch_model($1.strip)
-        true
-
-      when /^\/json (.+)/
-        schema = {
-          "type" => "object",
-          "properties" => {
-            "answer" => { "type" => "string" },
-            "confidence" => { "type" => "number" }
-          },
-          "required" => ["answer"]
-        }
-        result = @session.chat($1.strip, schema: schema)
-        puts "\nJSON: #{result[:parsed].inspect}"
-        true
-
-      when /^\/tools (.+)/
-        result = @session.chat($1.strip, tools: true)
-        puts "\nResult: #{result.inspect}"
-        true
-
-      when /^\/embed (.+)/
-        embedding = @session.embed($1.strip)
-        puts "Embedding: #{embedding[0..4].inspect}... (#{embedding.length} dims)"
-        true
+        client = Ollama::Client.new
+        puts client.list_model_names.join(", ")
 
       when "/help"
-        puts COMMANDS.join(", ")
-        true
+        puts "/quit /q  - Exit"
+        puts "/clear    - Reset conversation"
+        puts "/switch   - Switch model: /switch <name>"
+        puts "/models   - List models"
+        puts "/help     - This help"
 
       else
-        false
+        return false
       end
+
+      true
     end
   end
 end
