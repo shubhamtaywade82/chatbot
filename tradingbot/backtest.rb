@@ -219,71 +219,171 @@ module TradingBot
     end
 
     def self.detect_setup(candles, ms, displacements, obs, sweeps, pd, price, atr, config)
-      active_obs = obs.select { |ob| !ob[:invalidated] && !ob[:mitigated] }
-      recent_sweeps = sweeps.select { |s| s[:sweep_index] >= candles.size - 8 }
-      recent_bos = ms[:bos_events].select { |e| e[:index] >= candles.size - 8 }
+      active_obs = obs.select { |ob| !ob[:invalidated] }
+      recent_sweeps = sweeps.select { |s| s[:sweep_index] >= candles.size - 10 }
+      recent_bos = ms[:bos_events].select { |e| e[:index] >= candles.size - 10 }
+      recent_choch = ms[:choch_events].select { |e| e[:index] >= candles.size - 20 }
 
-      return nil unless recent_sweeps.any? || active_obs.any? || recent_bos.any?
+      in_discount = PDArray.discount?(price, pd)
+      trend = ms[:trend]
+      candidates = []
 
-      direction = nil
-      entry = price
-      sl = nil
-      tp = nil
-      rr = 0
-
-      if ms[:trend] == :bullish && PDArray.discount?(price, pd)
-        # Look for LONG
-        if recent_sweeps.any? { |s| s[:type].to_s.include?("SSL") || s[:type].to_s.include?("sell") }
-          direction = "LONG"
-          sl = [price - atr * 1.5, ms[:protected_low] || price - atr * 2].min
-          tp = price + (price - sl) * 2.5
-          rr = ((tp - price).abs / (price - sl).abs).round(2)
-        elsif active_obs.any? { |ob| ob[:direction] == :bullish }
-          direction = "LONG"
-          zone_min, zone_max = active_obs.find { |ob| ob[:direction] == :bullish }[:zone].minmax
-          sl = zone_min - atr * 0.5
-          tp = price + (price - sl) * 2.5
-          rr = ((tp - price).abs / (price - sl).abs).round(2)
-        end
-      elsif ms[:trend] == :bearish && !PDArray.discount?(price, pd)
-        # Look for SHORT
-        if recent_sweeps.any? { |s| s[:type].to_s.include?("BSL") || s[:type].to_s.include?("buy") }
-          direction = "SHORT"
-          sl = [price + atr * 1.5, ms[:protected_high] || price + atr * 2].max
-          tp = price - (sl - price) * 2.5
-          rr = ((price - tp).abs / (sl - price).abs).round(2)
-        elsif active_obs.any? { |ob| ob[:direction] == :bearish }
-          direction = "SHORT"
-          zone_min, zone_max = active_obs.find { |ob| ob[:direction] == :bearish }[:zone].minmax
-          sl = zone_max + atr * 0.5
-          tp = price - (sl - price) * 2.5
-          rr = ((price - tp).abs / (sl - price).abs).round(2)
-        end
+      # Strategy 1: BOS Retest
+      recent_bos.each do |bos|
+        s = bos_retest_setup(bos, price, atr, ms, config)
+        candidates << s if s
       end
 
-      return nil unless direction && rr >= config.min_rr_ratio
+      # Strategy 2: CHoCH Reversal
+      recent_choch.each do |choch|
+        s = choch_setup(choch, price, atr, ms, config)
+        candidates << s if s
+      end
 
-      risk_per_trade = config.initial_balance * (config.max_risk_per_trade_pct / 100.0)
-      risk_per_unit = (price - sl).abs
-      quantity = (risk_per_trade / risk_per_unit).round(4)
-      quantity = [[quantity, 0.01].max, 1000].min
+      # Strategy 3: Sweep + Trend
+      recent_sweeps.each do |sweep|
+        s = sweep_setup(sweep, price, atr, ms, pd, in_discount, config)
+        candidates << s if s
+      end
+
+      # Strategy 4: OB Bounce
+      active_obs.each do |ob|
+        s = ob_setup(ob, price, atr, ms, pd, in_discount, config)
+        candidates << s if s
+      end
+
+      # Strategy 5: Displacement follow
+      recent_disp = displacements.select { |d| d[:index] >= candles.size - 5 }
+      recent_disp.each do |disp|
+        s = displacement_setup(disp, price, atr, ms, config)
+        candidates << s if s
+      end
+
+      # Pick best by R:R (minimum 2.0)
+      candidates.select { |c| c[:rr] >= config.min_rr_ratio }
+                .max_by { |c| c[:rr] }
+    end
+
+    def self.bos_retest_setup(bos, price, atr, ms, config)
+      is_bullish = bos[:type].to_s.include?("bullish")
+      is_bearish = bos[:type].to_s.include?("bearish")
+      return nil unless is_bullish || is_bearish
+
+      if is_bullish
+        direction = "LONG"
+        sl = [price - atr * 2.0, ms[:protected_low] || price - atr * 3].min
+        tp = price + (price - sl) * 2.5
+      else
+        direction = "SHORT"
+        sl = [price + atr * 2.0, ms[:protected_high] || price + atr * 3].max
+        tp = price - (sl - price) * 2.5
+      end
+
+      rr = ((tp - price).abs / (price - sl).abs).round(2)
+      return nil if rr < config.min_rr_ratio
 
       { direction: direction, stop_loss: sl.round(4), take_profit: tp.round(4),
-        quantity: quantity, rr: rr }
+        quantity: calc_quantity(price, sl, config), rr: rr }
+    end
+
+    def self.choch_setup(choch, price, atr, ms, config)
+      is_bullish = choch[:choch_type].to_s.include?("bullish")
+      is_bearish = choch[:choch_type].to_s.include?("bearish")
+      return nil unless is_bullish || is_bearish
+
+      if is_bullish
+        direction = "LONG"
+        sl = [price - atr * 2.0, ms[:protected_low] || price - atr * 3].min
+        tp = price + (price - sl) * 3.0
+      else
+        direction = "SHORT"
+        sl = [price + atr * 2.0, ms[:protected_high] || price + atr * 3].max
+        tp = price - (sl - price) * 3.0
+      end
+
+      rr = ((tp - price).abs / (price - sl).abs).round(2)
+      return nil if rr < config.min_rr_ratio
+
+      { direction: direction, stop_loss: sl.round(4), take_profit: tp.round(4),
+        quantity: calc_quantity(price, sl, config), rr: rr }
+    end
+
+    def self.sweep_setup(sweep, price, atr, ms, pd, in_discount, config)
+      is_ssl = sweep[:type].to_s.include?("SSL") || sweep[:type].to_s.include?("sell")
+      is_bsl = sweep[:type].to_s.include?("BSL") || sweep[:type].to_s.include?("buy")
+
+      if is_ssl && (ms[:trend] != :bearish || in_discount)
+        direction = "LONG"
+        sl = [price - atr * 1.5, ms[:protected_low] || price - atr * 2].min
+        tp = price + (price - sl) * 2.5
+      elsif is_bsl && (ms[:trend] != :bullish || !in_discount)
+        direction = "SHORT"
+        sl = [price + atr * 1.5, ms[:protected_high] || price + atr * 2].max
+        tp = price - (sl - price) * 2.5
+      else
+        return nil
+      end
+
+      rr = ((tp - price).abs / (price - sl).abs).round(2)
+      return nil if rr < config.min_rr_ratio
+
+      { direction: direction, stop_loss: sl.round(4), take_profit: tp.round(4),
+        quantity: calc_quantity(price, sl, config), rr: rr }
+    end
+
+    def self.ob_setup(ob, price, atr, ms, pd, in_discount, config)
+      zone_min, zone_max = ob[:zone].minmax
+      proximity = ((price - zone_min).abs / (zone_max - zone_min + 0.01))
+      return nil unless proximity < 0.3
+
+      if ob[:direction] == :bullish
+        direction = "LONG"
+        sl = [zone_min - atr * 0.5, ms[:protected_low] || zone_min - atr].min
+        tp = price + (price - sl) * 2.5
+      elsif ob[:direction] == :bearish
+        direction = "SHORT"
+        sl = [zone_max + atr * 0.5, ms[:protected_high] || zone_max + atr].max
+        tp = price - (sl - price) * 2.5
+      else
+        return nil
+      end
+
+      rr = ((tp - price).abs / (price - sl).abs).round(2)
+      return nil if rr < config.min_rr_ratio
+
+      { direction: direction, stop_loss: sl.round(4), take_profit: tp.round(4),
+        quantity: calc_quantity(price, sl, config), rr: rr }
+    end
+
+    def self.displacement_setup(disp, price, atr, ms, config)
+      if disp[:direction] == :bullish
+        direction = "LONG"
+        sl = [price - atr * 2.0, ms[:protected_low] || price - atr * 3].min
+        tp = price + (price - sl) * 2.0
+      elsif disp[:direction] == :bearish
+        direction = "SHORT"
+        sl = [price + atr * 2.0, ms[:protected_high] || price + atr * 3].max
+        tp = price - (sl - price) * 2.0
+      else
+        return nil
+      end
+
+      rr = ((tp - price).abs / (price - sl).abs).round(2)
+      return nil if rr < config.min_rr_ratio
+
+      { direction: direction, stop_loss: sl.round(4), take_profit: tp.round(4),
+        quantity: calc_quantity(price, sl, config), rr: rr }
+    end
+
+    def self.calc_quantity(price, sl, config)
+      risk_per_trade = config.initial_balance * (config.max_risk_per_trade_pct / 100.0)
+      risk_per_unit = (price - sl).abs
+      return 0.01 if risk_per_unit <= 0
+      [[(risk_per_trade / risk_per_unit).round(4), 0.01].max, 1000].min
     end
 
     def self.log_backtest_trade(storage, trade, backtest_id)
-      pnl = trade[:pnl] || 0
-      storage.open_trade(
-        symbol: trade[:symbol], direction: trade[:direction],
-        entry_price: trade[:entry_price], quantity: trade[:quantity],
-        stop_loss: trade[:stop_loss],
-        take_profit_1: trade[:take_profit], take_profit_2: nil, take_profit_3: nil,
-        entry_reason: "backtest_#{trade[:exit_reason]}",
-        strategy: "smc_backtest", model_name: "backtest",
-        metadata: JSON.generate({ backtest_id: backtest_id, rr: trade[:rr],
-                                   exit_reason: trade[:exit_reason] })
-      )
+      storage.log_backtest_trade(trade, backtest_id)
     end
 
     def self.compute_metrics(trades, equity_curve, initial_balance)

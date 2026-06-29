@@ -9,6 +9,7 @@ module TradingBot
     def initialize(path = DB_PATH)
       @db = SQLite3::Database.new(path)
       @db.results_as_hash = true
+      @db.busy_timeout = 60_000
       migrate
     end
 
@@ -138,6 +139,44 @@ module TradingBot
       @db.last_insert_row_id
     end
 
+    def log_backtest_trade(trade, backtest_id)
+      pnl_pct = (((trade[:exit_price] / trade[:entry_price]) - 1) * 100) rescue 0.0
+      pnl_pct *= -1 if trade[:direction] == "SHORT"
+
+      params = {
+        symbol: trade[:symbol],
+        direction: trade[:direction],
+        entry_price: trade[:entry_price],
+        exit_price: trade[:exit_price],
+        quantity: trade[:quantity],
+        stop_loss: trade[:stop_loss],
+        take_profit_1: trade[:take_profit],
+        status: "closed",
+        pnl: trade[:pnl],
+        pnl_pct: pnl_pct ? pnl_pct.round(2) : 0.0,
+        rr_ratio: trade[:rr],
+        entry_reason: "backtest_#{trade[:exit_reason]}",
+        exit_reason: trade[:exit_reason],
+        entry_time: trade[:entry_time],
+        exit_time: trade[:exit_time],
+        strategy: "smc_backtest",
+        model_name: "backtest",
+        metadata: JSON.generate({ rr: trade[:rr], exit_reason: trade[:exit_reason] }),
+        backtest_id: backtest_id
+      }
+
+      @db.execute(<<~SQL, params)
+        INSERT INTO trades (symbol, direction, entry_price, exit_price, quantity, stop_loss,
+                            take_profit_1, status, pnl, pnl_pct, rr_ratio,
+                            entry_reason, exit_reason, entry_time, exit_time,
+                            strategy, model_name, metadata, backtest_id)
+        VALUES (:symbol, :direction, :entry_price, :exit_price, :quantity, :stop_loss,
+                :take_profit_1, :status, :pnl, :pnl_pct, :rr_ratio,
+                :entry_reason, :exit_reason, :entry_time, :exit_time,
+                :strategy, :model_name, :metadata, :backtest_id)
+      SQL
+    end
+
     def close_trade(id, exit_price:, pnl:, pnl_pct:, rr_ratio:, exit_reason:, fees: 0)
       params = { id: id, exit_price: exit_price, pnl: pnl, pnl_pct: pnl_pct,
                  rr_ratio: rr_ratio, exit_reason: exit_reason, fees: fees, status: "closed" }
@@ -214,7 +253,8 @@ module TradingBot
     end
 
     def finish_backtest(id, stats)
-      @db.execute(<<~SQL, stats.merge(id: id))
+      params = stats.transform_keys(&:to_s).merge("id" => id)
+      @db.execute(<<~SQL, params)
         UPDATE backtest_runs SET finished_at = datetime('now'),
           total_trades = :total_trades, win_rate = :win_rate, total_pnl = :total_pnl,
           max_drawdown = :max_drawdown, sharpe_ratio = :sharpe_ratio,

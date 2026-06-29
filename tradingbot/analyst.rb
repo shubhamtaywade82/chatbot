@@ -1,4 +1,4 @@
-require "ollama_agent"
+require "ollama_client"
 
 module TradingBot
   class Analyst
@@ -35,28 +35,28 @@ module TradingBot
 
     def initialize(config)
       @config = config
-      ENV["OLLAMA_BASE_URL"] = config.base_url
-      ENV["OLLAMA_AGENT_SKILLS"] = "0"
-      ENV["OLLAMA_AGENT_EXTERNAL_SKILLS"] = "0"
-      ENV.delete("OLLAMA_AGENT_THINK")
-
-      @runner = OllamaAgent::Runner.build(
-        model: config.model,
-        system_prompt: SYSTEM_PROMPT,
-        stream: false,
-        read_only: true,
-        skills_enabled: false,
-        think: nil,
-        http_timeout: 120
-      )
+      ollama_conf = Ollama::Config.new
+      ollama_conf.base_url = config.base_url
+      ollama_conf.timeout = 120
+      @client = Ollama::Client.new(config: ollama_conf)
     end
 
     def analyze(symbol:, events:, multi_tf_data:, open_trades_count:)
       market_context = build_context(symbol, events, multi_tf_data, open_trades_count)
       start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      response = @runner.run(market_context)
+
+      response = @client.chat(
+        model: @config.model,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: market_context }
+        ],
+        think: false,
+        options: { temperature: 0.2, num_predict: 256 }
+      )
+
       duration_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time) * 1000).to_i
-      response_text = response.is_a?(Hash) ? (response[:content] || response["content"] || response.to_s) : response.to_s
+      response_text = response.respond_to?(:message) ? response.message.content : response.to_s
       parsed = parse_response(response_text, events)
       parsed[:raw_response] = response_text
       parsed[:prompt] = market_context

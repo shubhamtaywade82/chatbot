@@ -29,7 +29,7 @@ module TradingBot
       puts "=" * 60
 
       @config.symbols.each do |symbol|
-        @symbol_states[symbol] = { last_event_time: 0, last_analysis_time: 0 }
+        @symbol_states[symbol] = { last_event_time: nil, last_analysis_time: 0 }
       end
 
       while @running
@@ -59,6 +59,7 @@ module TradingBot
       @config.symbols.each do |symbol|
         state = @symbol_states[symbol] || {}
         open_trades = @storage.open_trades(symbol: symbol).size
+        total_open_trades = @storage.open_trades.size
 
         log_status(symbol, now, state, open_trades)
 
@@ -67,7 +68,9 @@ module TradingBot
 
         should_analyze = events.any? || time_for_periodic?(symbol, now)
 
-        if should_analyze && can_analyze?(symbol, now) && open_trades < @config.max_open_trades
+        if should_analyze && can_analyze?(symbol, now) &&
+           open_trades < @config.max_setups_per_symbol &&
+           total_open_trades < @config.max_open_trades
           perform_analysis(symbol, events, open_trades)
           state[:last_analysis_time] = now
         end
@@ -207,9 +210,9 @@ module TradingBot
     end
 
     def log_status(symbol, now, state, open_trades)
-      last_event = state[:last_event_time] || 0
-      time_since = ((now - last_event) / 60).round(1)
-      print "#{Time.now.strftime("%H:%M:%S")} #{symbol} open=#{open_trades} events=#{time_since}m ago"
+      last_event = state[:last_event_time]
+      time_since = last_event ? "#{((now - last_event) / 60).round(1)}m ago" : "never"
+      print "#{Time.now.strftime("%H:%M:%S")} #{symbol} open=#{open_trades} events=#{time_since}"
     end
 
     def log_events(symbol, events)
