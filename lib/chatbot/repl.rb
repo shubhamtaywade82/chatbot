@@ -1,5 +1,6 @@
 require "readline"
 require "ollama_client"
+require_relative "phase1/tool_loop"
 
 module Chatbot
   class REPL
@@ -13,6 +14,9 @@ module Chatbot
 
     def run
       @running = true
+      puts "-" * 50
+      puts "Type /help to see available commands."
+      puts "Type /trade <ETHUSDT|SOLUSDT|XRPUSDT> [timeframe] to execute Phase 1 agent."
       puts "-" * 50
 
       while @running
@@ -79,11 +83,20 @@ module Chatbot
         client = Ollama::Client.new
         puts client.list_model_names.join(", ")
 
+      when "/trade"
+        puts "Usage: /trade <ETHUSDT|SOLUSDT|XRPUSDT> [timeframe]"
+
+      when /^\/trade\s+(\S+)(?:\s+(\S+))?/
+        symbol = $1.strip.upcase
+        timeframe = $2 ? $2.strip : "1h"
+        run_phase1_agent(symbol, timeframe)
+
       when "/help"
         puts "/quit /q  - Exit"
         puts "/clear    - Reset conversation"
         puts "/switch   - Switch model: /switch <name>"
         puts "/models   - List models"
+        puts "/trade    - Run Phase 1 trading agent: /trade <symbol> [timeframe]"
         puts "/help     - This help"
 
       else
@@ -91,6 +104,35 @@ module Chatbot
       end
 
       true
+    end
+
+    def run_phase1_agent(symbol, timeframe)
+      unless %w[ETHUSDT SOLUSDT XRPUSDT].include?(symbol)
+        puts "[ERROR] Invalid symbol: #{symbol}. Phase 1 only allows: ETHUSDT, SOLUSDT, XRPUSDT."
+        return
+      end
+
+      # Configure model pool using the currently active session settings
+      endpoints = [
+        { url: @session.config.base_url, model: @session.config.model }
+      ]
+
+      puts "🤖 Launching Phase 1 Agent iteration for #{symbol} (#{timeframe})..."
+      loop_runner = Chatbot::Phase1::ToolLoop.new(endpoints: endpoints)
+      
+      result = loop_runner.run_iteration(symbol, timeframe)
+      
+      puts "\n=== AGENT RESPONSE CONTRACT ==="
+      puts JSON.pretty_generate(result)
+      puts "================================"
+
+      # Print Trace details
+      if loop_runner.logger.traces.any?
+        puts "\n" + loop_runner.logger.format_trace(loop_runner.logger.traces.last)
+      end
+    rescue => e
+      puts "[ERROR] Agent execution failed: #{e.message}"
+      puts e.backtrace.first(5).join("\n")
     end
   end
 end

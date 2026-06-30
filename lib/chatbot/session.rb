@@ -135,6 +135,15 @@ module OllamaAgent
   end
 end
 
+# Phase 1 Agent components
+require_relative "phase1/binance_adapter"
+require_relative "phase1/indicator_calculator"
+require_relative "phase1/risk_validator"
+require_relative "phase1/paper_exchange"
+
+# Singleton paper exchange instance shared across tool calls within a session
+$phase1_paper_exchange = Chatbot::Phase1::PaperExchange.new(1000.0)
+
 # Register chatbot tools
 OllamaAgent::Tools.register("http_get", schema: {
   description: "Fetch any HTTP/HTTPS URL and return the response body. " \
@@ -202,7 +211,7 @@ BINANCE_API = "https://api.binance.com"
 OllamaAgent::Tools.register("fetch_klines", schema: {
   description: "Get OHLCV candlestick data for a cryptocurrency trading pair from Binance. " \
                "Returns open, high, low, close, volume for each candle. " \
-               "Use for technical analysis, chart patterns, and SMC level detection.",
+               "Use for technical analysis, chart patterns, SMC level detection, and as input to calculate_indicators.",
   parameters: {
     type: "object",
     properties: {
@@ -273,7 +282,7 @@ end
 OllamaAgent::Tools.register("fetch_orderbook", schema: {
   description: "Get current order book depth for a cryptocurrency trading pair from Binance. " \
                "Returns top bids and asks with price and quantity. " \
-               "Use for liquidity analysis, support/resistance levels, and order flow.",
+               "Use for liquidity analysis, support/resistance levels, order flow, and spread assessment before execution.",
   parameters: {
     type: "object",
     properties: {
@@ -1386,10 +1395,11 @@ OllamaAgent::Tools.register("position_sizing", schema: {
 end
 
 OllamaAgent::Tools.register("risk_check", schema: {
-  description: "Analyze the risk of a proposed trade before execution. " \
-               "Checks current positions, available margin, distance to liquidation, " \
-               "and portfolio exposure. Call this BEFORE place_order when the user requests a trade. " \
-               "If risk is acceptable, ask the user to confirm before placing the order.",
+  description: "Analyze the risk of a proposed trade against the live Binance account before execution. " \
+               "Checks available margin, position value, liquidation distance, and portfolio exposure. " \
+               "Requires API credentials. Call this BEFORE place_order. " \
+               "For symbol-universe symbol (ETHUSDT/SOLUSDT/XRPUSDT), also call validate_trade_risk which enforces " \
+               "stop direction, R:R >= 1.5, and data freshness without needing an API key.",
   parameters: {
     type: "object",
     properties: {
@@ -1762,54 +1772,188 @@ rescue => e
 end
 
 # ---------------------------------------------------------------------------
+# Indicator Engine — deterministic Ruby calculations, no model math
+# Works for any Binance symbol; feeds into identify_trade_setup and risk decisions.
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("calculate_indicators", schema: {
+  description: "Compute technical indicators (RSI 14, EMA 20, EMA 50, MACD, ATR 14, Bollinger Bands, Volume Trend) " \
+               "for any symbol and timeframe using deterministic Ruby — the model must NEVER compute these itself. " \
+               "Call after fetch_klines and before identify_trade_setup or validate_trade_risk. " \
+               "Returns a structured indicator summary including EMA trend bias.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. ETHUSDT, SOLUSDT, XRPUSDT, BTCUSDT"
+      },
+      interval: {
+        type: "string",
+        description: "Candle interval: 1m, 5m, 15m, 1h, 4h, 1d (default: 1h)"
+      }
+    },
+    required: ["symbol"]
+  }
+}) do |args, **|
+  symbol   = args["symbol"].to_s.upcase.strip
+  interval = args["interval"]&.to_s&.strip || "1h"
+  url      = "#{BINANCE_API}/api/v3/klines?symbol=#{symbol}&interval=#{interval}&limit=100"
+  raw      = JSON.parse(Net::HTTP.get(URI(url)))
+  candles  = raw.map { |k| { time: k[0] / 1000, open: k[1].to_f, high: k[2].to_f, low: k[3].to_f, close: k[4].to_f, volume: k[5].to_f, close_time: k[6] / 1000 } }
+  next "No candle data for #{symbol} #{interval}" if candles.empty?
+
+  calc      = Chatbot::Phase1::IndicatorCalculator
+  rsi       = calc.calculate_rsi(candles, 14).compact.last&.round(2)
+  ema20     = calc.calculate_ema(candles, 20).compact.last&.round(4)
+  ema50     = calc.calculate_ema(candles, 50).compact.last&.round(4)
+  macd_data = calc.calculate_macd(candles)
+  macd      = macd_data[:macd].compact.last&.round(6)
+  macd_sig  = macd_data[:signal].compact.last&.round(6)
+  macd_hist = macd_data[:histogram].compact.last&.round(6)
+  atr       = calc.calculate_atr(candles, 14).compact.last&.round(6)
+  bb        = calc.calculate_bollinger_bands(candles, 20, 2.0)
+  vol       = calc.calculate_volume_trend(candles, 20)
+  price     = candles.last[:close]
+
+  ema_bias  = ema20 && ema50 ? (ema20 > ema50 ? "BULLISH (EMA20 > EMA50)" : "BEARISH (EMA20 < EMA50)") : "N/A"
+  rsi_note  = rsi ? (rsi > 70 ? " [Overbought]" : rsi < 30 ? " [Oversold]" : "") : ""
+
+  [
+    "Indicators #{symbol} #{interval}:",
+    "Price: #{price}",
+    "RSI(14): #{rsi}#{rsi_note}",
+    "EMA20: #{ema20}  EMA50: #{ema50}  Bias: #{ema_bias}",
+    "MACD: #{macd}  Signal: #{macd_sig}  Histogram: #{macd_hist}",
+    "ATR(14): #{atr}",
+    "Bollinger Bands(20,2): Upper=#{bb[:upper].compact.last&.round(4)}  Basis=#{bb[:basis].compact.last&.round(4)}  Lower=#{bb[:lower].compact.last&.round(4)}",
+    "Volume Trend: #{vol[:trend]} (ratio: #{vol[:ratio]})"
+  ].join("\n")
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
+# Risk gate — deterministic stop/R:R/staleness validation, no API key needed.
+# Complements risk_check (which requires a live Binance account).
+# ---------------------------------------------------------------------------
+OllamaAgent::Tools.register("validate_trade_risk", schema: {
+  description: "Deterministic pre-trade risk gate. Validates: (1) stop loss direction is correct for BUY/SELL, " \
+               "(2) R:R ratio >= 1.5, (3) risk percent within 2% cap, (4) candle data is fresh (< 5 min old). " \
+               "Returns APPROVED or HOLD with per-check detail. No API key required. " \
+               "Call this AFTER identify_trade_setup and BEFORE risk_check + place_order. " \
+               "If result is HOLD, abort the trade — do not proceed to execution.",
+  parameters: {
+    type: "object",
+    properties: {
+      symbol: {
+        type: "string",
+        description: "Trading pair symbol, e.g. ETHUSDT, SOLUSDT, XRPUSDT"
+      },
+      action: {
+        type: "string",
+        enum: ["BUY", "SELL"],
+        description: "BUY for long, SELL for short"
+      },
+      entry_price: { type: "number", description: "Proposed entry price" },
+      stop_loss:   { type: "number", description: "Proposed stop loss price" },
+      take_profit: { type: "number", description: "Proposed take profit price" },
+      risk_percent: { type: "number", description: "Percentage of equity to risk, e.g. 1.0" }
+    },
+    required: ["symbol", "action", "entry_price", "stop_loss", "take_profit", "risk_percent"]
+  }
+}) do |args, **|
+  symbol = args["symbol"].to_s.upcase.strip
+  # Fetch a small candle set just for freshness check — reuses BINANCE_API constant
+  url     = "#{BINANCE_API}/api/v3/klines?symbol=#{symbol}&interval=1h&limit=3"
+  raw     = JSON.parse(Net::HTTP.get(URI(url)))
+  candles = raw.map { |k| { time: k[0] / 1000, close: k[4].to_f, close_time: k[6] / 1000 } }
+
+  intent = {
+    symbol:       symbol,
+    action:       args["action"].to_s.upcase,
+    entry_price:  args["entry_price"].to_f,
+    stop_loss:    args["stop_loss"].to_f,
+    take_profit:  args["take_profit"].to_f,
+    risk_percent: args["risk_percent"].to_f,
+    candles:      candles
+  }
+
+  equity  = $phase1_paper_exchange.equity
+  result  = Chatbot::Phase1::RiskValidator.validate(intent, equity: equity, max_risk_pct: 2.0)
+  checks  = result[:risk_checks]
+
+  [
+    "Risk Gate: #{symbol} #{args['action']}",
+    "Verdict       : #{result[:action]} (#{result[:approved] ? 'APPROVED' : 'HOLD'})",
+    "Reason        : #{result[:reason]}",
+    "Stop Valid    : #{checks[:stop_valid]}   (BUY: SL<entry<TP | SELL: TP<entry<SL)",
+    "R:R >= 1.5    : #{checks[:rr_valid]}",
+    "Risk <= 2%    : #{checks[:risk_within_limit]}",
+    "Data Fresh    : #{checks[:schema_valid]}",
+    "Paper Equity  : $#{equity.round(2)}"
+  ].join("\n")
+rescue => e
+  "Error: #{e.message}"
+end
+
+# ---------------------------------------------------------------------------
 # Session — orchestrates config + runner + env
 # ---------------------------------------------------------------------------
 module Chatbot
   class Session
     SYSTEM_PROMPT = "You are an automated crypto futures trading agent with institutional SMC expertise. " \
                     "Always fetch LIVE data — never make up prices or levels. " \
-                    "You have 28 tools organized into layers. USE THEM AUTONOMOUSLY in this order:\n" \
+                    "You have 30 tools. USE THEM AUTONOMOUSLY in this order:\n" \
                     "\n" \
-                    "1. MARKET ANALYSIS (always start here):\n" \
-                    "   - analyze_multi_tf(symbol, trading_style) — PRIMARY: multi-timeframe trend, BOS/CHoCH, OBs, sweeps, PD\n" \
+                    "1. MARKET DATA (raw inputs — call first):\n" \
+                    "   - fetch_ticker(symbol) — current price, 24h high/low/volume/change\n" \
+                    "   - fetch_klines(symbol, interval, limit?) — OHLCV candles\n" \
+                    "   - fetch_orderbook(symbol, limit?) — bid/ask depth, spread\n" \
+                    "   - get_funding_rate(symbol) — market sentiment\n" \
+                    "   - get_open_interest(symbol) — trend confirmation\n" \
+                    "   - subscribe_market_data(symbol, channel, duration_sec) — real-time WebSocket stream\n" \
+                    "\n" \
+                    "2. INDICATOR ENGINE (always call before deciding — never compute these yourself):\n" \
+                    "   - calculate_indicators(symbol, interval) — RSI 14, EMA 20/50, MACD, ATR 14, Bollinger Bands, Volume Trend (all Ruby, deterministic)\n" \
+                    "\n" \
+                    "3. SMC ANALYSIS:\n" \
+                    "   - analyze_multi_tf(symbol, trading_style) — PRIMARY: multi-TF trend, BOS/CHoCH, OBs, sweeps, PD\n" \
                     "   - find_smc_levels(symbol, interval) — single-TF deep dive\n" \
-                    "   - get_funding_rate(symbol) — market sentiment (Binance)\n" \
-                    "   - get_open_interest(symbol) — trend confirmation (Binance)\n" \
-                    "   - subscribe_market_data(symbol, channel, duration_sec) — real-time trades/klines/depth via WebSocket\n" \
-                    "\n" \
-                    "2. DEEP DIVE (call these after analyze_multi_tf for precision):\n" \
                     "   - analyze_market_structure(symbol, interval) — BOS/CHoCH, HH/LH/HL/LL, protected levels\n" \
                     "   - find_liquidity_sweeps(symbol, interval) — stop hunts, equal highs/lows\n" \
                     "   - find_order_blocks(symbol, interval) — displacement-confirmed OBs, mitigation state\n" \
                     "\n" \
-                    "3. TRADE SETUP (flagship tool — combines all engines):\n" \
-                    "   - identify_trade_setup(symbol, trading_style) — returns concrete entry/SL/TP1/TP2/TP3 with R:R\n" \
+                    "4. TRADE SETUP (flagship — combines all SMC engines):\n" \
+                    "   - identify_trade_setup(symbol, trading_style) — concrete entry/SL/TP1/TP2/TP3 with R:R\n" \
                     "\n" \
-                    "4. RISK MANAGEMENT:\n" \
-                    "   - position_sizing(symbol, entry_price, stop_loss, risk_percent, leverage) — optimal quantity\n" \
-                    "   - risk_check(symbol, side, entry_price, quantity, stop_loss, leverage) — full risk assessment\n" \
+                    "5. RISK MANAGEMENT (always in this order):\n" \
+                    "   - validate_trade_risk(symbol, action, entry_price, stop_loss, take_profit, risk_percent) — deterministic gate: stop direction, R:R>=1.5, risk cap, freshness. No API key needed. HOLD = abort.\n" \
+                    "   - position_sizing(symbol, entry_price, stop_loss, risk_percent, leverage) — optimal quantity from live balance\n" \
+                    "   - risk_check(symbol, side, entry_price, quantity, stop_loss, leverage) — live account: margin, liquidation, portfolio exposure\n" \
                     "\n" \
-                    "5. ACCOUNT STATE:\n" \
-                    "   - get_account_balance — Binance available margin\n" \
+                    "6. ACCOUNT STATE:\n" \
+                    "   - get_account_balance — Binance margin\n" \
                     "   - get_positions(symbol) — Binance open positions\n" \
                     "   - get_open_orders(symbol) — Binance pending orders\n" \
-                    "   - coindcx_get_balance — CoinDCX asset balances\n" \
+                    "   - coindcx_get_balance — CoinDCX balances\n" \
                     "   - coindcx_get_positions(market) — CoinDCX positions\n" \
                     "   - coindcx_get_open_orders(market) — CoinDCX pending orders\n" \
                     "\n" \
-                    "6. EXECUTION (CoinDCX is for trade execution; Binance for market data only):\n" \
-                    "   - coindcx_place_order(market, side, order_type, quantity, price?) — place on CoinDCX\n" \
-                    "   - coindcx_cancel_order(id, market) — cancel on CoinDCX\n" \
-                    "   - set_leverage(symbol, leverage) — set Binance leverage\n" \
-                    "   - place_order — Binance order (fallback)\n" \
-                    "   - cancel_order — Binance cancel (fallback)\n" \
+                    "7. EXECUTION:\n" \
+                    "   - coindcx_place_order(market, side, order_type, quantity, price?) — preferred execution\n" \
+                    "   - coindcx_cancel_order(id, market)\n" \
+                    "   - set_leverage(symbol, leverage)\n" \
+                    "   - place_order / cancel_order — Binance fallback\n" \
                     "\n" \
-                    "RULES:\n" \
-                    " - When user asks about ANY crypto topic, run analyze_multi_tf + identify_trade_setup automatically.\n" \
-                    " - Present the setup to the user with entry, SL, TP levels and R:R. Ask for confirmation.\n" \
-                    " - Use subscribe_market_data for entry timing (real-time tick precision).\n" \
-                    " - For execution, use CoinDCX tools (coindcx_*) by default. Binance tools are for market data only.\n" \
-                    " - Never place an order without risk_check first and explicit user confirmation."
+                    "HARD RULES:\n" \
+                    " - NEVER compute RSI, EMA, MACD, ATR yourself — always call calculate_indicators.\n" \
+                    " - validate_trade_risk must return APPROVED before any order. If HOLD, abort.\n" \
+                    " - Standard workflow: fetch_ticker → calculate_indicators → analyze_multi_tf → identify_trade_setup → validate_trade_risk → position_sizing → risk_check → [confirm with user] → place order.\n" \
+                    " - Use subscribe_market_data for tick-precise entry timing.\n" \
+                    " - Prefer CoinDCX for execution; Binance tools for market data only.\n" \
+                    " - Never place an order without validate_trade_risk + risk_check passed and explicit user confirmation."
+
+    attr_reader :config
 
     def initialize(config)
       @config = config

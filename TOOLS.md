@@ -101,6 +101,24 @@ To add the same tool as a built-in in ollama_agent:
 |------|-------------|----------|------------------------|
 | `subscribe_market_data` | Streams live trade prints, 1m/5m klines, or top-20 depth via Binance WebSocket | 1-30s (default 5s) | Entry timing — needs latest tick before executing |
 
+### Phase 1 Agent Tools — Deterministic Ruby (ETHUSDT / SOLUSDT / XRPUSDT only)
+
+These 6 tools are registered as proper `OllamaAgent::Tools` so the **LLM calls them autonomously** during the tool loop — the same way it calls `fetch_klines` or `identify_trade_setup`. All math is computed in Ruby; the model only orchestrates.
+
+| Tool | What it does | When the model calls it |
+|------|-------------|------------------------|
+| `p1_get_ticker` | Spot price from Binance | First step before Phase 1 analysis |
+| `p1_get_klines` | Raw OHLCV candles (up to 500) | Before indicator computation |
+| `p1_get_order_book` | Best bid/ask, spread, top-5 depth | Liquidity context, slippage estimate |
+| `p1_get_stats_24hr` | 24h high/low/change/volume | Volatility regime, trend strength |
+| `p1_calculate_indicators` | RSI, EMA 20/50, MACD, ATR, Bollinger Bands, Volume Trend — **all computed in Ruby** | After klines fetch, before trade decision |
+| `p1_validate_risk` | Deterministic risk gate: stop direction, R:R ≥ 1.5, risk % cap, data freshness | **Mandatory** before any paper/live trade |
+
+> **Hard rules enforced in the SYSTEM_PROMPT:**
+> - Never call Phase 1 tools for symbols outside `ETHUSDT/SOLUSDT/XRPUSDT`.
+> - `p1_validate_risk` must return `APPROVED` — if it returns `HOLD`, the trade is aborted.
+> - The model **never** computes indicators itself; it always calls `p1_calculate_indicators`.
+
 ### Account & Position Management (requires API key)
 
 | Tool | What it does | When the model calls it |
