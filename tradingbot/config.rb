@@ -12,6 +12,7 @@ module TradingBot
     :binance_api_key, :binance_api_secret,
     :coindcx_api_key, :coindcx_api_secret,
     :telegram_enabled, :telegram_bot_token, :telegram_chat_id,
+    :sl_atr_multiplier, :tp_risk_multiplier, :max_hold_hours,
     keyword_init: true
   ) do
     def self.load(path = nil)
@@ -55,7 +56,10 @@ module TradingBot
         coindcx_api_secret: ENV["CHAT_COINDCX_API_SECRET"],
         telegram_enabled: raw.dig("telegram", "enabled") || false,
         telegram_bot_token: raw.dig("telegram", "bot_token"),
-        telegram_chat_id: raw.dig("telegram", "chat_id")
+        telegram_chat_id: raw.dig("telegram", "chat_id"),
+        sl_atr_multiplier: raw.dig("strategy", "sl_atr_multiplier") || 2.5,
+        tp_risk_multiplier: raw.dig("strategy", "tp_risk_multiplier") || 3.5,
+        max_hold_hours: raw.dig("strategy", "max_hold_hours") || 48
       )
     end
 

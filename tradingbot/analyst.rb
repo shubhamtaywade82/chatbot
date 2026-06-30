@@ -26,15 +26,17 @@ module TradingBot
       }
 
       SMC Setup Criteria:
-      - LONG: Sweep of buy-side liquidity (BSL) OR order block retest + bullish BOS/CHoCH on higher TF + price in discount zone
-      - SHORT: Sweep of sell-side liquidity (SSL) OR order block retest + bearish BOS/CHoCH on higher TF + price in premium zone
+      - LONG: Reversal after Sell-Side Liquidity (SSL) sweep, OR bullish Order Block retest, OR bullish BOS/CHoCH pullback.
+      - SHORT: Reversal after Buy-Side Liquidity (BSL) sweep, OR bearish Order Block retest, OR bearish BOS/CHoCH pullback.
+      - TREND ALIGNMENT: Setups (BOS Retest, Order Blocks, and Displacements) MUST align with the current trend (e.g., LONG only in a bullish trend, SHORT only in a bearish trend). CHoCH reversals represent the start of a new trend.
+      - PREMIUM/DISCOUNT: LONG entries must be in the DISCOUNT zone (below equilibrium). SHORT entries must be in the PREMIUM zone (above equilibrium).
       - Minimum R:R ratio: 2.0
-      - Entry at order block zone or after sweep reclaim
-      - Stop loss beyond the sweep level or OB zone
+      - Stop loss placed beyond the sweep level or order block zone boundary.
     PROMPT
 
-    def initialize(config)
+    def initialize(config, storage = nil)
       @config = config
+      @storage = storage
       ollama_conf = Ollama::Config.new
       ollama_conf.base_url = config.base_url
       ollama_conf.timeout = 120
@@ -74,6 +76,22 @@ module TradingBot
       context += "Symbol: #{symbol}\n"
       context += "Open Trades: #{open_trades_count}/#{@config.max_open_trades}\n"
       context += "Mode: #{@config.mode}\n\n"
+
+      context += "--- Optimized Strategy Parameters ---\n"
+      context += "Stop Loss Offset: #{@config.sl_atr_multiplier} * ATR from entry, placed beyond the OB boundary/sweep level.\n"
+      context += "Take Profit Target: Target at least #{@config.tp_risk_multiplier} * Risk (R:R ratio >= #{@config.tp_risk_multiplier}).\n"
+      context += "Max Trade Hold Duration: #{@config.max_hold_hours} hours.\n\n"
+
+      if @storage
+        lessons = @storage.recent_lessons(symbol: symbol, limit: 5)
+        if lessons.any?
+          context += "--- Self-Learning: Lessons from Past Trades ---\n"
+          lessons.each do |l|
+            context += "- [Outcome: #{l['outcome']}] #{l['lesson']}\n"
+          end
+          context += "\n"
+        end
+      end
 
       if events.any?
         context += "--- Recent Events ---\n"

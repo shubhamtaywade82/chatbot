@@ -132,6 +132,27 @@ module TradingBot
       tp2 = trade["take_profit_2"]&.to_f
       tp3 = trade["take_profit_3"]&.to_f
 
+      # Break-even Trigger: Move SL to Entry if TP1 is hit
+      if tp1
+        if direction == "LONG" && current_price >= tp1 && sl < entry
+          @storage.update_stop_loss(trade["id"], entry)
+          trade["stop_loss"] = entry
+          sl = entry
+          @storage.log_event(symbol: symbol, event_type: "stop_loss_moved",
+                             price: entry, description: "SL moved to break-even ($#{entry.round(4)})")
+          puts "  🛡️ Stop Loss moved to Break-Even for #{symbol} LONG at $#{entry.round(4)}"
+          TelegramNotifier.send_alert(@config, "🛡️ *Stop Loss moved to Break-Even* for LONG #{symbol} @ $#{entry.round(4)}")
+        elsif direction == "SHORT" && current_price <= tp1 && sl > entry
+          @storage.update_stop_loss(trade["id"], entry)
+          trade["stop_loss"] = entry
+          sl = entry
+          @storage.log_event(symbol: symbol, event_type: "stop_loss_moved",
+                             price: entry, description: "SL moved to break-even ($#{entry.round(4)})")
+          puts "  🛡️ Stop Loss moved to Break-Even for #{symbol} SHORT at $#{entry.round(4)}"
+          TelegramNotifier.send_alert(@config, "🛡️ *Stop Loss moved to Break-Even* for SHORT #{symbol} @ $#{entry.round(4)}")
+        end
+      end
+
       return close_trade(trade, current_price, "stop_loss") if direction == "LONG" && current_price <= sl
       return close_trade(trade, current_price, "stop_loss") if direction == "SHORT" && current_price >= sl
       return close_trade(trade, current_price, "take_profit_3") if tp3 && direction == "LONG" && current_price >= tp3

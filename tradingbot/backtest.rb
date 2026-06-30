@@ -1,3 +1,5 @@
+require "time"
+require "net/http"
 require "securerandom"
 require "json"
 require_relative "config"
@@ -199,7 +201,7 @@ module TradingBot
           end
         end
 
-        max_hold = 48
+        max_hold = config.max_hold_hours
         if position && (i - position[:entry_index]) >= max_hold
           exit_price = slice_1h.last[:close]
           pnl = position[:direction] == "LONG" ?
@@ -269,14 +271,21 @@ module TradingBot
       is_bearish = bos[:type].to_s.include?("bearish")
       return nil unless is_bullish || is_bearish
 
+      # Trend Alignment Filter
+      return nil if is_bullish && ms[:trend] != :bullish
+      return nil if is_bearish && ms[:trend] != :bearish
+
+      sl_m = config.sl_atr_multiplier
+      tp_m = config.tp_risk_multiplier
+
       if is_bullish
         direction = "LONG"
-        sl = [price - atr * 2.0, ms[:protected_low] || price - atr * 3].min
-        tp = price + (price - sl) * 2.5
+        sl = [price - atr * sl_m, ms[:protected_low] || price - atr * (sl_m + 1)].min
+        tp = price + (price - sl) * tp_m
       else
         direction = "SHORT"
-        sl = [price + atr * 2.0, ms[:protected_high] || price + atr * 3].max
-        tp = price - (sl - price) * 2.5
+        sl = [price + atr * sl_m, ms[:protected_high] || price + atr * (sl_m + 1)].max
+        tp = price - (sl - price) * tp_m
       end
 
       rr = ((tp - price).abs / (price - sl).abs).round(2)
@@ -291,14 +300,17 @@ module TradingBot
       is_bearish = choch[:choch_type].to_s.include?("bearish")
       return nil unless is_bullish || is_bearish
 
+      sl_m = config.sl_atr_multiplier
+      tp_m = config.tp_risk_multiplier
+
       if is_bullish
         direction = "LONG"
-        sl = [price - atr * 2.0, ms[:protected_low] || price - atr * 3].min
-        tp = price + (price - sl) * 3.0
+        sl = [price - atr * sl_m, ms[:protected_low] || price - atr * (sl_m + 1)].min
+        tp = price + (price - sl) * tp_m
       else
         direction = "SHORT"
-        sl = [price + atr * 2.0, ms[:protected_high] || price + atr * 3].max
-        tp = price - (sl - price) * 3.0
+        sl = [price + atr * sl_m, ms[:protected_high] || price + atr * (sl_m + 1)].max
+        tp = price - (sl - price) * tp_m
       end
 
       rr = ((tp - price).abs / (price - sl).abs).round(2)
@@ -312,14 +324,17 @@ module TradingBot
       is_ssl = sweep[:type].to_s.include?("SSL") || sweep[:type].to_s.include?("sell")
       is_bsl = sweep[:type].to_s.include?("BSL") || sweep[:type].to_s.include?("buy")
 
+      sl_m = config.sl_atr_multiplier
+      tp_m = config.tp_risk_multiplier
+
       if is_ssl && (ms[:trend] != :bearish || in_discount)
         direction = "LONG"
-        sl = [price - atr * 1.5, ms[:protected_low] || price - atr * 2].min
-        tp = price + (price - sl) * 2.5
+        sl = [price - atr * (sl_m * 0.75), ms[:protected_low] || price - atr * sl_m].min
+        tp = price + (price - sl) * tp_m
       elsif is_bsl && (ms[:trend] != :bullish || !in_discount)
         direction = "SHORT"
-        sl = [price + atr * 1.5, ms[:protected_high] || price + atr * 2].max
-        tp = price - (sl - price) * 2.5
+        sl = [price + atr * (sl_m * 0.75), ms[:protected_high] || price + atr * sl_m].max
+        tp = price - (sl - price) * tp_m
       else
         return nil
       end
@@ -336,14 +351,20 @@ module TradingBot
       proximity = ((price - zone_min).abs / (zone_max - zone_min + 0.01))
       return nil unless proximity < 0.3
 
+      # Trend Alignment Filter
+      return nil if ob[:direction] == :bullish && ms[:trend] != :bullish
+      return nil if ob[:direction] == :bearish && ms[:trend] != :bearish
+
+      tp_m = config.tp_risk_multiplier
+
       if ob[:direction] == :bullish
         direction = "LONG"
         sl = [zone_min - atr * 0.5, ms[:protected_low] || zone_min - atr].min
-        tp = price + (price - sl) * 2.5
+        tp = price + (price - sl) * tp_m
       elsif ob[:direction] == :bearish
         direction = "SHORT"
         sl = [zone_max + atr * 0.5, ms[:protected_high] || zone_max + atr].max
-        tp = price - (sl - price) * 2.5
+        tp = price - (sl - price) * tp_m
       else
         return nil
       end
@@ -356,14 +377,21 @@ module TradingBot
     end
 
     def self.displacement_setup(disp, price, atr, ms, config)
+      # Trend Alignment Filter
+      return nil if disp[:direction] == :bullish && ms[:trend] != :bullish
+      return nil if disp[:direction] == :bearish && ms[:trend] != :bearish
+
+      sl_m = config.sl_atr_multiplier
+      tp_m = config.tp_risk_multiplier
+
       if disp[:direction] == :bullish
         direction = "LONG"
-        sl = [price - atr * 2.0, ms[:protected_low] || price - atr * 3].min
-        tp = price + (price - sl) * 2.0
+        sl = [price - atr * sl_m, ms[:protected_low] || price - atr * (sl_m + 1)].min
+        tp = price + (price - sl) * tp_m
       elsif disp[:direction] == :bearish
         direction = "SHORT"
-        sl = [price + atr * 2.0, ms[:protected_high] || price + atr * 3].max
-        tp = price - (sl - price) * 2.0
+        sl = [price + atr * sl_m, ms[:protected_high] || price + atr * (sl_m + 1)].max
+        tp = price - (sl - price) * tp_m
       else
         return nil
       end

@@ -93,7 +93,7 @@ module TradingBot
 
       @db.execute("ALTER TABLE signals ADD COLUMN raw_response TEXT") rescue nil
 
-      @db.execute(<<~SQL)
+      @db.execute_batch(<<~SQL)
         CREATE TABLE IF NOT EXISTS llm_responses (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           symbol TEXT,
@@ -103,6 +103,16 @@ module TradingBot
           parsed_action TEXT,
           model_name TEXT,
           duration_ms INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_lessons (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trade_id INTEGER UNIQUE REFERENCES trades(id),
+          symbol TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          outcome TEXT NOT NULL,
+          lesson TEXT NOT NULL,
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
       SQL
@@ -194,6 +204,11 @@ module TradingBot
                   [reason, id])
     end
 
+    def update_stop_loss(id, new_sl)
+      @db.execute("UPDATE trades SET stop_loss = ? WHERE id = ?", [new_sl, id])
+    end
+
+
     def open_trades(symbol: nil)
       query = "SELECT * FROM trades WHERE status = 'open'"
       query += " AND symbol = ?" if symbol
@@ -211,6 +226,29 @@ module TradingBot
 
     def recent_llm_responses(limit: 20)
       @db.execute("SELECT * FROM llm_responses ORDER BY created_at DESC LIMIT ?", [limit])
+    end
+    def save_lesson(trade_id:, symbol:, direction:, outcome:, lesson:)
+      @db.execute(
+        "INSERT OR IGNORE INTO trade_lessons (trade_id, symbol, direction, outcome, lesson) VALUES (?, ?, ?, ?, ?)",
+        [trade_id, symbol, direction, outcome, lesson]
+      )
+    end
+
+    def recent_lessons(symbol:, limit: 5)
+      @db.execute(
+        "SELECT outcome, lesson FROM trade_lessons WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+        [symbol, limit]
+      )
+    end
+
+    def unprocessed_closed_trades(limit: 5)
+      @db.execute(<<~SQL, [limit])
+        SELECT t.* FROM trades t
+        LEFT JOIN trade_lessons l ON t.id = l.trade_id
+        WHERE t.status = 'closed' AND l.id IS NULL AND t.backtest_id IS NULL
+        ORDER BY t.exit_time DESC
+        LIMIT ?
+      SQL
     end
 
     def log_event(symbol:, event_type:, timeframe: nil, price: nil, description:)
@@ -253,7 +291,11 @@ module TradingBot
     end
 
     def finish_backtest(id, stats)
-      params = stats.transform_keys(&:to_s).merge("id" => id)
+      keys = [:total_trades, :win_rate, :total_pnl, :max_drawdown, :sharpe_ratio, :profit_factor]
+      params = {}
+      keys.each { |k| params[k] = stats[k] }
+      params[:id] = id
+
       @db.execute(<<~SQL, params)
         UPDATE backtest_runs SET finished_at = datetime('now'),
           total_trades = :total_trades, win_rate = :win_rate, total_pnl = :total_pnl,

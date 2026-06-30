@@ -4,6 +4,7 @@ require_relative "scanner"
 require_relative "analyst"
 require_relative "trader"
 require_relative "telegram_notifier"
+require_relative "self_learning"
 require_relative "../lib/chatbot/terminal_markdown"
 require_relative "../lib/chatbot/smc_engines"
 
@@ -15,7 +16,7 @@ module TradingBot
       @config = config
       @storage = Storage.new
       @scanner = Scanner.new(@storage, config)
-      @analyst = Analyst.new(config)
+      @analyst = Analyst.new(config, @storage)
       @trader = Trader.new(@storage, config)
       @running = false
       @last_analysis = {}
@@ -94,6 +95,9 @@ module TradingBot
 
         check_open_positions(symbol)
       end
+
+      # Self-Learning Feedback Loop
+      SelfLearning.process_closed_trades(@storage, @config)
 
       print_summary if @config.verbose?
     end
