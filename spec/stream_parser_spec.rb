@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/chatbot/streaming/parser"
-require_relative "../../lib/chatbot/streaming/reasoning/extractor"
+require_relative "../lib/chatbot/streaming/parser"
+require_relative "../lib/chatbot/streaming/reasoning/extractor"
 
 RSpec.describe Chatbot::Streaming::Parser do
   let(:extractor) { Chatbot::Streaming::Reasoning::Qwen.new }

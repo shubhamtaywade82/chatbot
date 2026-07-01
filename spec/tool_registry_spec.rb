@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/chatbot/tools/registry"
-require_relative "../../lib/chatbot/tools/calculator"
+require_relative "../lib/chatbot/tools/registry"
+require_relative "../lib/chatbot/tools/calculator"
 
 RSpec.describe Chatbot::ToolRegistry do
   let(:registry) { described_class.new }

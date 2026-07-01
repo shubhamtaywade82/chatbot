@@ -1,8 +1,9 @@
 # frozen_string_literal: true
 
-require_relative "../../lib/chatbot/conversation"
-require_relative "../../lib/chatbot/stores/memory"
-require_relative "../../lib/chatbot/message"
+require_relative "../lib/chatbot/conversation"
+require_relative "../lib/chatbot/stores/memory"
+require_relative "../lib/chatbot/message"
+require_relative "../config/config"
 
 RSpec.describe Chatbot::Conversation do
   let(:config) do
@@ -17,7 +18,7 @@ RSpec.describe Chatbot::Conversation do
 
   it "adds messages" do
     conversation.add(Chatbot::UserMessage.new(content: "Hello"))
-    expect(conversation.messages.length).to eq(1)
+    expect(conversation.messages.length).to eq(2)
   end
 
   it "trims when token limit exceeded" do

@@ -3,6 +3,7 @@ require "net/http"
 require "uri"
 require "json"
 require "openssl"
+require "set"
 require "ollama_agent"
 require_relative "smc_engines"
 require_relative "terminal_markdown"
@@ -130,6 +131,73 @@ module OllamaAgent
             @hooks.emit(:on_complete, {})
           }
         }
+      end
+    end
+  end
+end
+
+# Show more of tool results in stderr preview (default gem truncates to 60 chars)
+module OllamaAgent
+  module Console
+    module_function
+
+    def tool_result_line(name, result)
+      preview = result.to_s[0, 200].gsub(/\s+/, " ")
+      preview += "..." if result.to_s.length > 200
+      dim("◀ #{name}: #{preview}")
+    end
+  end
+end
+
+# Hard interceptor: block duplicate tool calls AND enforce max calls per query.
+# The model (qwen3.5) gets stuck calling the same tools repeatedly.
+# Patch Toolbox#execute — the FINAL point where ALL tools are executed.
+module OllamaAgent
+  class Toolbox
+    MAX_TOOL_CALLS_PER_QUERY = 8
+
+    alias_method :orig_execute, :execute
+
+    def execute(name, args, context:)
+      # Global tracker (persists across tool calls within a session)
+      unless @_tc_history
+        @_tc_history = {}
+        @_tc_count = 0
+      end
+
+      @_tc_count += 1
+
+      if @_tc_count > MAX_TOOL_CALLS_PER_QUERY
+        $stderr.puts "\e[33m⛔ BLOCKED: max #{MAX_TOOL_CALLS_PER_QUERY} tool calls reached\e[0m"
+        $stderr.flush
+        return "STOP: You have made #{@_tc_count} tool calls. You have enough data. Write your final analysis NOW. Do NOT call any more tools."
+      end
+
+      fp = "#{name}|#{(args || {}).sort_by { |k, _| k.to_s }.map { |k, v| "#{k}=#{v}" }.join(",")}"
+      if @_tc_history[fp]
+        $stderr.puts "\e[33m⛔ BLOCKED duplicate: #{name}\e[0m"
+        $stderr.flush
+        return "DUPLICATE: You already called #{name} with these exact args. Move to the NEXT step."
+      end
+
+      @_tc_history[fp] = true
+      orig_execute(name, args, context: context)
+    end
+  end
+end
+
+# Monkeypatch Ollama provider to pass num_predict for adequate output length
+module OllamaAgent
+  module Providers
+    class Ollama < Base
+      private
+
+      alias_method :orig_build_request, :build_request
+      def build_request(messages:, model:, tools:, temperature:, think:)
+        req = orig_build_request(messages: messages, model: model, tools: tools, temperature: temperature, think: think)
+        req[:options] ||= {}
+        req[:options][:num_predict] = 4096
+        req
       end
     end
   end
@@ -1951,7 +2019,15 @@ module Chatbot
                     " - Standard workflow: fetch_ticker → calculate_indicators → analyze_multi_tf → identify_trade_setup → validate_trade_risk → position_sizing → risk_check → [confirm with user] → place order.\n" \
                     " - Use subscribe_market_data for tick-precise entry timing.\n" \
                     " - Prefer CoinDCX for execution; Binance tools for market data only.\n" \
-                    " - Never place an order without validate_trade_risk + risk_check passed and explicit user confirmation."
+                    " - Never place an order without validate_trade_risk + risk_check passed and explicit user confirmation.\n" \
+                    "\n" \
+                    "ANTI-LOOP RULES (CRITICAL):\n" \
+                    " - NEVER call the same tool twice with the same arguments in one turn.\n" \
+                    " - Step 1 (market data): call fetch_ticker, fetch_klines, fetch_orderbook ONCE each. Done. Move on.\n" \
+                    " - After step 1 data is returned, PROCEED to step 2 (calculate_indicators). Do NOT re-fetch market data.\n" \
+                    " - If you already have ticker/klines/orderbook data for a symbol, you have ENOUGH. Stop fetching.\n" \
+                    " - Maximum total tool calls per response: 8. After 8 calls, STOP and write your analysis.\n" \
+                    " - After calling calculate_indicators + analyze_multi_tf + identify_trade_setup, you MUST write your final analysis text. No more tool calls."
 
     attr_reader :config
 
@@ -1990,6 +2066,7 @@ module Chatbot
         skills_enabled: false,
         think: nil,
         http_timeout: @config.timeout,
+        max_tokens: @config.max_response_tokens,
         session_id: @session_id,
         resume: false
       )

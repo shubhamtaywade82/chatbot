@@ -12,15 +12,15 @@ module Chatbot
 
     def initialize
       @base_url = ENV.fetch("CHAT_BASE_URL", "http://localhost:11434")
-      @model = ENV.fetch("OLLAMA_MODEL", "qwen3.5:4b")
+      @model = ENV.fetch("OLLAMA_MODEL", "qwen3.5:latest")
       @api_keys = ENV["OLLAMA_API_KEYS"]
       @enable_multi_key_concurrency = ENV["ENABLE_MULTI_KEY_CONCURRENCY"] == "true"
       @system_prompt = "You are a helpful, concise assistant. Think step by step when solving problems."
-      @timeout = 120
+      @timeout = 300
       @retries = 3
-      @max_history_tokens = 4096
-      @max_response_tokens = 1024
-      @max_tool_iterations = 10
+      @max_history_tokens = 8192
+      @max_response_tokens = 4096
+      @max_tool_iterations = 12
       @min_history_messages = 6
       @embedding_model = ENV.fetch("OLLAMA_EMBED_MODEL", "nomic-embed-text:latest")
       @conversation_persistence_path = ENV.fetch("CHAT_HISTORY_PATH", "./chat_history.json")

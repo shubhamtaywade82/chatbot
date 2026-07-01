@@ -51,7 +51,7 @@ puts "Sending direct chat request to Ollama..."
 start_time = Time.now
 begin
   resp = client.chat(
-    model: "qwen3.5:4b",
+    model: "qwen3.5:latest",
     messages: [
       { role: "system", content: system_prompt },
       { role: "user", content: market_context }

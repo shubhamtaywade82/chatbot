@@ -115,6 +115,7 @@ These 6 tools are registered as proper `OllamaAgent::Tools` so the **LLM calls t
 | `p1_validate_risk` | Deterministic risk gate: stop direction, R:R ≥ 1.5, risk % cap, data freshness | **Mandatory** before any paper/live trade |
 
 > **Hard rules enforced in the SYSTEM_PROMPT:**
+>
 > - Never call Phase 1 tools for symbols outside `ETHUSDT/SOLUSDT/XRPUSDT`.
 > - `p1_validate_risk` must return `APPROVED` — if it returns `HOLD`, the trade is aborted.
 > - The model **never** computes indicators itself; it always calls `p1_calculate_indicators`.
@@ -159,6 +160,7 @@ The `analyze_multi_tf` tool maps trading styles to optimal timeframes:
 | `positional` | 4h | 1d | 1w | Days–weeks |
 
 Each style analyzes 2-3 timeframes and reports:
+
 - **Per timeframe**: trend, last swing high/low, order blocks, FVGs
 - **Confluence**: do all timeframes agree on direction?
 - **Bias**: specific trade recommendation based on alignment
@@ -166,11 +168,13 @@ Each style analyzes 2-3 timeframes and reports:
 ## Tool Patterns
 
 **Raw data tools** (`fetch_klines`, `fetch_ticker`, `fetch_orderbook`, `get_funding_rate`, `get_open_interest`):
+
 - Fetch from Binance API (public endpoints)
 - Parse JSON, extract relevant fields
 - Return formatted string
 
 **Engine-based compound tools** (`find_smc_levels`, `analyze_multi_tf`):
+
 - Use `smc_engines.rb` modules (PivotDetector, MarketStructure, Displacement, OrderBlock, LiquiditySweep, PDArray)
 - BOS/CHoCH detection, swing classification (HH/LH/HL/LL), protected levels
 - ATR-based displacement confirmation for institutional impulse detection
@@ -179,24 +183,29 @@ Each style analyzes 2-3 timeframes and reports:
 - Premium/discount zone evaluation
 
 **Deep-dive SMC tools** (`analyze_market_structure`, `find_liquidity_sweeps`, `find_order_blocks`):
+
 - Each exposes one engine layer for the model to inspect
 - Called after `analyze_multi_tf` when the model needs precision timing/levels
 
 **Flagship tool** (`identify_trade_setup`):
+
 - Calls ALL engines internally across 2-3 timeframes (depending on trading style)
 - Implements PB-7 Sweep+OB and PB-3 BOS Pullback trade setups (ported from smc-backtester)
 - Returns concrete entry price, stop loss, TP1/TP2/TP3, and R:R ratio
 - Uses EntryConfirmation module for candle pattern detection (engulfing, rejection wicks)
 
 **State tools** (`get_account_balance`, `get_positions`, `get_open_orders`):
+
 - Call Binance Futures signed endpoints (HMAC SHA256)
 - Never modify state
 
 **Execution tools** (`place_order`, `cancel_order`, `set_leverage`):
+
 - Modify state on Binance Futures
 - `place_order` always requires risk_check first and user confirmation
 
 **Risk tools** (`position_sizing`, `risk_check`):
+
 - Enforce position limits (max 2% risk per trade warning)
 - Must be called before `place_order`
 
@@ -220,6 +229,7 @@ signature = OpenSSL::HMAC.hexdigest("SHA256", secret, query)
 ```
 
 API key requirements (Binance Futures):
+
 - Enable Futures trading on the API key
 - Permissions: enable "Futures" (Enable Trading + Enable Withdrawals optional)
 - Never share or commit your API secret
@@ -241,6 +251,7 @@ signature = OpenSSL::HMAC.hexdigest("SHA256", secret, json_body)
 ```
 
 API key requirements (CoinDCX):
+
 - Create API key with trade permissions in CoinDCX dashboard
 - Never share or commit your API secret
 
@@ -261,20 +272,20 @@ Implementation uses `websocket-client-simple` gem and connects to `wss://stream.
 User: "Swing trade SOLUSDT"
   → analyze_multi_tf(SOLUSDT, swing)               # Multi-TF context
   → identify_trade_setup(SOLUSDT, swing)            # Concrete entry/SL/TP
- 
+
   If setup found:
     → get_funding_rate(SOLUSDT)                      # Sentiment check
     → get_open_interest(SOLUSDT)                     # Trend confirmation
     → position_sizing(SOLUSDT, entry, SL, 1%, 3x)    # Quantity
     → risk_check(SOLUSDT, BUY, entry, qty, SL, 3x)   # Validate
     → Present to user: "Entry $X, SL $Y, TP1 $Z (1R), TP2 $Z (2R), TP3 $Z (3R). Confirm?"
-    
+
   If NO setup:
     → analyze_market_structure(SOLUSDT, 1h)          # BOS/CHoCH deep dive
     → find_liquidity_sweeps(SOLUSDT, 15m)            # Sweep timing
     → find_order_blocks(SOLUSDT, 1h)                 # OB precision
     → Present levels to watch + what needs to happen for setup activation
-  
+
 User: "confirm"
   → set_leverage
   → coindcx_place_order (CoinDCX preferred for execution)
@@ -288,7 +299,7 @@ All engines are in `lib/chatbot/smc_engines.rb`, ported from the smc-backtester 
 ```
 Candles (Binance API)
   → PivotDetector (swing highs/lows with left/right bars)
-  → MarketStructure (BOS/CHoCH, HH/LH/HL/LL, protected levels)  
+  → MarketStructure (BOS/CHoCH, HH/LH/HL/LL, protected levels)
   → ATR (Wilder smoothing, period 14)
   → Displacement (body 1.5x ATR, range 2x ATR, min body 60%)
   → OrderBlock (creation at BOS, mitigation, invalidation)
@@ -302,7 +313,7 @@ Candles (Binance API)
 
 | Model | Tool Calling | Notes |
 |-------|-------------|-------|
-| qwen3.5:4b | Excellent | Calls tools correctly, follows descriptions |
+| qwen3.5:latest | Excellent | Calls tools correctly, follows descriptions |
 | qwen3:8b | Excellent | Better multi-step reasoning, 8k+ context |
 | qwen3.5:9.7b | Excellent | Best for complex multi-tool analysis |
 | llama3.1:8b | Poor | Hallucinates parameter names, calls tools for "hello" |

@@ -33,7 +33,7 @@ module TradingBot
         poll_interval_sec: raw.dig("monitor", "poll_interval_sec") || 60,
         timeframes: raw.dig("monitor", "timeframes") || %w[15m 1h 4h],
         candle_limit: raw.dig("monitor", "candle_limit") || 200,
-        model: raw.dig("analysis", "model") || "qwen3.5:4b",
+        model: raw.dig("analysis", "model") || "qwen3.5:latest",
         base_url: raw.dig("analysis", "base_url") || "http://localhost:11434",
         min_analysis_interval_sec: raw.dig("analysis", "min_analysis_interval_sec") || 120,
         max_setups_per_symbol: raw.dig("analysis", "max_setups_per_symbol") || 1,

@@ -10,7 +10,7 @@ module Chatbot
       attr_reader :endpoints
 
       # @param endpoints [Array<Hash>] Array of fallback config maps, e.g.:
-      #   [{ url: "http://localhost:11434", key: "...", model: "qwen3.5:4b" }]
+      #   [{ url: "http://localhost:11434", key: "...", model: "qwen3.5:latest" }]
       def initialize(endpoints)
         @endpoints = endpoints
       end
@@ -38,7 +38,7 @@ module Chatbot
             http = Net::HTTP.new(url.host, url.port)
             http.read_timeout = 60
             http.open_timeout = 10
-            
+
             # Use SSL if https is specified
             http.use_ssl = true if url.scheme == "https"
 
